@@ -98,8 +98,8 @@ At this point you should see three things and **no Signal Control components
 yet**:
 
 ```
-dash0-operator-controller-...                             1/1  Running
 dash0-operator-cluster-metrics-collector-deployment-...    2/2  Running
+dash0-operator-controller-...                              1/1  Running
 dash0-operator-opentelemetry-collector-agent-daemonset-... 3/3  Running
 ```
 
@@ -170,18 +170,24 @@ the three operator workloads are unchanged, and everything marked below is new
 since applying the resource above.
 
 ```
-dash0-operator-controller-...                              Running
-dash0-operator-cluster-metrics-collector-deployment-...    Running
-dash0-operator-opentelemetry-collector-agent-daemonset-... Running
-dash0-operator-edge-proxy-...                              Running   <- new
-dash0-operator-edge-proxy-...                              Running   <- new
-dash0-operator-signal-control-collector-deployment-...     Running   <- new
-dash0-operator-signal-control-collector-deployment-...     Running   <- new
+dash0-operator-cluster-metrics-collector-deployment-...    2/2  Running
+dash0-operator-controller-...                              1/1  Running
+dash0-operator-edge-proxy-...                              1/1  Running   <- new
+dash0-operator-edge-proxy-...                              1/1  Running   <- new
+dash0-operator-opentelemetry-collector-agent-daemonset-... 3/3  Running
+dash0-operator-signal-control-collector-deployment-...     2/2  Running   <- new
+dash0-operator-signal-control-collector-deployment-...     2/2  Running   <- new
 ```
 
-Four new pods, two per Deployment. That is the whole visible effect of the
-`Dash0SignalControl` resource: the Helm flag in step 3 changed nothing in the
-cluster, and applying six lines of YAML is what actually built the pipeline.
+Four new pods, two per Deployment. Note they interleave alphabetically rather
+than appearing at the end, so read the names, not the positions. The collector
+pods show `2/2` because each runs the collector alongside a
+`configuration-reloader` sidecar, the same pairing as the operator's own
+OpenTelemetry agent; the edge-proxy pods run a single container.
+
+That is the whole visible effect of the `Dash0SignalControl` resource: the Helm
+flag in step 3 changed nothing in the cluster, and applying six lines of YAML
+is what actually built the pipeline.
 
 Nothing downstream works until both Deployments are running.
 
