@@ -1,0 +1,60 @@
+# Signal-to-metrics derives metrics at the edge from 100% of signals, before
+# sampling -- so these stay accurate no matter how few traces are retained.
+---
+# Spans -> exponential histogram of checkout latency.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SignalToMetrics
+metadata:
+  name: checkout-duration
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Checkout duration
+  match:
+    signal: spans
+    filters:
+      - key: dash0.operation.name
+        operator: is
+        value: GET /checkout
+  output:
+    name: sc_test.checkout.duration
+    description: Latency of /checkout requests, derived at the edge from all spans
+    interval: 30s
+    keepResourceAttributes:
+      - operator: is_one_of
+        values:
+          - service.name
+          - k8s.namespace.name
+          - k8s.pod.name
+    keepSignalAttributes:
+      - operator: is_one_of
+        values:
+          - http.response.status_code
+          - http.request.method
+---
+# Logs -> count of failed checkouts.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SignalToMetrics
+metadata:
+  name: checkout-failures
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Checkout failures
+  match:
+    signal: logs
+    filters:
+      - key: otel.log.body
+        operator: contains
+        value: "payment declined"
+  output:
+    name: sc_test.checkout.failures
+    description: Count of payment-declined log records
+    interval: 30s
+    keepResourceAttributes:
+      - operator: is_one_of
+        values:
+          - service.name
+          - k8s.namespace.name

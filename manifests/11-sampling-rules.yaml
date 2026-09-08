@@ -1,0 +1,80 @@
+# Tail-sampling rules. With Signal Control enabled and no rules present, no
+# traces are retained -- rules define what gets kept. These three exercise the
+# distinct condition kinds: error, and(ottl + probabilistic), and a rate limit.
+---
+# 1. Keep every failing trace. ~12% of /checkout requests return HTTP 500.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SamplingRule
+metadata:
+  name: keep-all-errors
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Keep all error traces
+  conditions:
+    kind: error
+    # The CRD allows `kind: error` with no spec, but the backend rejects the
+    # rule ("invalid error spec: unexpected end of JSON input") unless spec is
+    # present, so an empty object is required here.
+    spec: {}
+---
+# 2. Keep 25% of successful checkouts. The 'and' combines a scoping OTTL
+#    condition with a probabilistic rate, so the 25% applies only to /checkout
+#    and not to all traffic.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SamplingRule
+metadata:
+  name: sample-checkout-25pct
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Sample 25% of checkouts
+  conditions:
+    kind: and
+    spec:
+      conditions:
+        - kind: ottl
+          spec:
+            ottl: attributes["dash0.operation.name"] == "GET /checkout"
+        - kind: probabilistic
+          spec:
+            rate: "0.25"
+---
+# 3. Keep search traces but never more than 10 per minute.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SamplingRule
+metadata:
+  name: rate-limit-search
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Search traces, max 10/min
+  conditions:
+    kind: ottl
+    spec:
+      ottl: attributes["dash0.operation.name"] == "GET /search"
+  rateLimit:
+    rate: 10
+---
+# 4. Baseline safety net: keep 1% of every trace that no more specific rule
+#    already retains. Rules are OR'd together (any matching rule keeps the
+#    trace), so this doesn't reduce what keep-all-errors, sample-checkout-25pct,
+#    or rate-limit-search already retain -- it just puts a floor under
+#    everything else, most visibly GET /orders/:id, which has no rule of its
+#    own today and is otherwise fully dropped.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SamplingRule
+metadata:
+  name: baseline-sample-1pct
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Baseline 1% of everything else
+  conditions:
+    kind: probabilistic
+    spec:
+      rate: "0.01"

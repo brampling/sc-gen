@@ -1,0 +1,163 @@
+# The traffic definition. This is the file you edit to change what the test bed
+# sends into Signal Control.
+#
+# The load generator reads it and re-reads it every 10 seconds, so an edit takes
+# effect without a restart -- allow up to ~60s for kubelet to propagate the
+# ConfigMap into the pod, then 10s for the reload. The control panel reads the
+# same ConfigMap to render its signal list, so there is one source of truth for
+# what is being generated.
+#
+# Fields per stream:
+#   id          stable key, used by the control panel
+#   path        request path on checkout-service; {rand} expands to a random int
+#   operation   the dash0.operation.name the span will carry, after the
+#               dash0operation processor normalises the path. Used to line each
+#               stream up against the Signal Control rules that target it.
+#   intervalMs  delay between requests
+#   enabled     set false to stop one stream without stopping the generator
+#   purpose     free text, shown in the control panel
+#   emits       which signal types this stream produces, and the attributes each
+#               one carries. Shown in the control panel so you can write a rule
+#               against an attribute that exists.
+#
+# The attribute lists below were read off real telemetry from this test bed on
+# operator 0.153.0, not copied from the semantic conventions. The injected
+# Node.js agent emits OLD-semconv HTTP attributes: http.target, http.host,
+# http.flavor. There is no url.path. A rule written against url.path syncs
+# cleanly, compiles to valid OTTL, and never matches. Check the attribute names
+# on your own telemetry before writing a rule against them.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: load-profile
+  namespace: sc-test
+data:
+  profile.json: |
+    {
+      "target": "http://checkout-service.sc-test.svc.cluster.local:8080",
+      "streams": [
+        {
+          "id": "health",
+          "path": "/health",
+          "operation": "GET /health",
+          "intervalMs": 200,
+          "enabled": true,
+          "purpose": "High-volume, zero-value telemetry. The spam-filter target.",
+          "emits": [
+            {
+              "signalType": "traces",
+              "note": "One SERVER span per request.",
+              "attributes": [
+                { "key": "dash0.operation.name", "example": "GET /health" },
+                { "key": "dash0.operation.type", "example": "http" },
+                { "key": "dash0.span.name", "example": "GET /health" },
+                { "key": "http.request.method", "example": "GET" },
+                { "key": "http.target", "example": "/health" },
+                { "key": "http.response.status_code", "example": "200" },
+                { "key": "url.full", "example": "http://checkout-service…/health" }
+              ]
+            },
+            {
+              "signalType": "logs",
+              "note": "One record per request, severity DEBUG. The JSON body is parsed by the collector, so its fields become log record attributes.",
+              "attributes": [
+                { "key": "otel.log.body", "example": "healthcheck probe served" },
+                { "key": "endpoint", "example": "/health" },
+                { "key": "noise", "example": "true" },
+                { "key": "dash0.log.processor.type", "example": "json" },
+                { "key": "log.iostream", "example": "stdout" }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "checkout",
+          "path": "/checkout",
+          "operation": "GET /checkout",
+          "intervalMs": 1000,
+          "enabled": true,
+          "purpose": "Multi-span trace, 12% HTTP 500. Error and probabilistic sampling, plus signal-to-metrics.",
+          "emits": [
+            {
+              "signalType": "traces",
+              "note": "Three spans per request: the /checkout SERVER span, a CLIENT span for the call to /inventory, and the /inventory SERVER span. CLIENT spans carry no dash0.operation.name.",
+              "attributes": [
+                { "key": "dash0.operation.name", "example": "GET /checkout" },
+                { "key": "dash0.operation.type", "example": "http" },
+                { "key": "dash0.span.name", "example": "GET /checkout" },
+                { "key": "http.request.method", "example": "GET" },
+                { "key": "http.target", "example": "/checkout" },
+                { "key": "http.response.status_code", "example": "200 or 500" },
+                { "key": "url.full", "example": "http://checkout-service…/checkout" }
+              ]
+            },
+            {
+              "signalType": "logs",
+              "note": "One record per request. Severity INFO on success, ERROR on a declined payment. severityText is empty even so, so filter on severity number, not text.",
+              "attributes": [
+                { "key": "otel.log.body", "example": "checkout completed or checkout failed: payment declined" },
+                { "key": "endpoint", "example": "/checkout" },
+                { "key": "sku", "example": "sku-1003" },
+                { "key": "dash0.log.processor.type", "example": "json" },
+                { "key": "log.iostream", "example": "stdout" }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "search",
+          "path": "/search?q=query-{rand}",
+          "operation": "GET /search",
+          "intervalMs": 2000,
+          "enabled": true,
+          "purpose": "The rate-limit target.",
+          "emits": [
+            {
+              "signalType": "traces",
+              "note": "One SERVER span per request. Note http.target keeps the query string, which dash0.operation.name does not.",
+              "attributes": [
+                { "key": "dash0.operation.name", "example": "GET /search" },
+                { "key": "dash0.span.name", "example": "GET /search" },
+                { "key": "http.request.method", "example": "GET" },
+                { "key": "http.target", "example": "/search?q=query-48213" },
+                { "key": "http.response.status_code", "example": "200" },
+                { "key": "url.full", "example": "http://checkout-service…/search?q=…" }
+              ]
+            },
+            {
+              "signalType": "logs",
+              "note": "One record per request, severity INFO. The random query lands in its own attribute, so this is where log-side cardinality comes from.",
+              "attributes": [
+                { "key": "otel.log.body", "example": "search executed" },
+                { "key": "endpoint", "example": "/search" },
+                { "key": "q", "example": "query-48213" },
+                { "key": "dash0.log.processor.type", "example": "json" },
+                { "key": "log.iostream", "example": "stdout" }
+              ]
+            }
+          ]
+        },
+        {
+          "id": "orders",
+          "path": "/orders/{rand}",
+          "operation": "GET /orders/:id",
+          "intervalMs": 2000,
+          "enabled": true,
+          "purpose": "High-cardinality path, normalised to :id by dash0operation. No rule of its own.",
+          "emits": [
+            {
+              "signalType": "traces",
+              "note": "One SERVER span per request, and the only signal this stream produces. dash0operation normalises the path to :id with no cardinality rule configured, so the raw id survives only on http.target and url.full.",
+              "attributes": [
+                { "key": "dash0.operation.name", "example": "GET /orders/:id" },
+                { "key": "dash0.span.name", "example": "GET /orders/:id" },
+                { "key": "http.request.method", "example": "GET" },
+                { "key": "http.target", "example": "/orders/482137" },
+                { "key": "http.response.status_code", "example": "200" },
+                { "key": "url.full", "example": "http://checkout-service…/orders/482137" }
+              ]
+            }
+          ]
+        }
+      ]
+    }

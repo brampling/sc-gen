@@ -1,0 +1,450 @@
+# Emits synthetic OTLP metrics on a fixed interval, for experimenting with time
+# series aggregation in Dash0.
+#
+# Find it on the Dash0 side with the constant attribute below. Attribute keys
+# use dots in OTLP and underscores in PromQL, so:
+#
+#   {otel_metric_name="sc_gen.synthetic.gauge", sc_gen_source="sc-gen"}
+#   sum by (sc_gen_region) ({otel_metric_name="sc_gen.synthetic.gauge"})
+#   sum by (sc_gen_region) (rate({otel_metric_name="sc_gen.synthetic.counter"}[5m]))
+#
+# The emitter posts OTLP/JSON straight to the node-local collector on port
+# 40318, the same endpoint the operator injects into instrumented workloads.
+# That keeps it dependency-free: no OTel SDK, no protobuf, no build step.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metric-profile
+  namespace: sc-test
+data:
+  profile.json: |
+    {
+      "intervalSeconds": 10,
+      "startupDelaySeconds": 20,
+      "serviceName": "sc-gen-metric-emitter",
+      "constantAttributes": {
+        "sc_gen.source": "sc-gen"
+      },
+      "dimensions": {
+        "sc_gen.service": ["api", "worker", "db"],
+        "sc_gen.region": ["eu-west-1", "us-east-1", "ap-south-1"],
+        "sc_gen.tier": ["free", "pro"]
+      },
+      "metrics": [
+        {
+          "name": "sc_gen.synthetic.gauge",
+          "type": "gauge",
+          "unit": "ms",
+          "description": "Synthetic latency-shaped gauge. One series per dimension combination.",
+          "baseline": 120,
+          "amplitude": 45,
+          "periodSeconds": 600,
+          "jitter": 10
+        },
+        {
+          "name": "sc_gen.synthetic.counter",
+          "type": "sum",
+          "unit": "1",
+          "description": "Synthetic monotonic request counter, cumulative temporality.",
+          "ratePerSecond": 2.5,
+          "jitter": 0.5
+        }
+      ]
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metric-emitter-src
+  namespace: sc-test
+data:
+  emitter.js: |
+    // Dependency-free OTLP/JSON metric emitter. Node stdlib only.
+    //
+    // The collector's OTLP HTTP receiver accepts application/json on /v1/metrics
+    // as well as protobuf, which is what makes an SDK-free emitter possible.
+    const http = require('http');
+    const fs = require('fs');
+
+    const PROFILE = '/profile/profile.json';
+    const STATS_PORT = 8080;
+    const RELOAD_MS = 10000;
+
+    // Set by the operator's convention: the node-local collector on hostPort
+    // 40318. NODE_IP comes from the downward API.
+    const ENDPOINT = process.env.OTLP_METRICS_ENDPOINT
+      || `http://${process.env.NODE_IP}:40318/v1/metrics`;
+
+    // Cumulative sums must report a start time that does not move, or the
+    // backend cannot tell a genuine increase from a counter reset.
+    const START_NANOS = String(Date.now() * 1e6);
+
+    function log(level, message, extra) {
+      process.stdout.write(JSON.stringify({ level, message, ...extra, ts: new Date().toISOString() }) + '\n');
+    }
+
+    function readProfile() {
+      const p = JSON.parse(fs.readFileSync(PROFILE, 'utf8'));
+      if (!Array.isArray(p.metrics) || !p.metrics.length) throw new Error('profile has no metrics');
+      if (!p.dimensions || typeof p.dimensions !== 'object') throw new Error('profile has no dimensions');
+      return p;
+    }
+
+    // Cartesian product of the dimension values: one series per combination.
+    function seriesFor(profile) {
+      const keys = Object.keys(profile.dimensions);
+      let combos = [{}];
+      for (const key of keys) {
+        const values = profile.dimensions[key];
+        const next = [];
+        for (const combo of combos) for (const value of values) next.push({ ...combo, [key]: value });
+        combos = next;
+      }
+      return combos.map((attrs) => ({ ...(profile.constantAttributes || {}), ...attrs }));
+    }
+
+    function attrList(obj) {
+      return Object.entries(obj).map(([key, value]) => ({ key, value: { stringValue: String(value) } }));
+    }
+
+    // Stable per-series offset, so each series has its own shape rather than
+    // every series tracing the same curve.
+    function hash(text) {
+      let h = 0;
+      for (let i = 0; i < text.length; i += 1) h = (h * 31 + text.charCodeAt(i)) | 0;
+      return Math.abs(h);
+    }
+
+    // Cumulative totals per metric+series, kept across profile reloads.
+    const totals = new Map();
+
+    function gaugePoint(metric, attrs, nowMs) {
+      const seed = hash(metric.name + JSON.stringify(attrs));
+      const period = (metric.periodSeconds || 600) * 1000;
+      const phase = (seed % 1000) / 1000 * Math.PI * 2;
+      const wave = Math.sin((nowMs / period) * Math.PI * 2 + phase);
+      const jitter = (Math.random() - 0.5) * 2 * (metric.jitter || 0);
+      const value = (metric.baseline || 100) + (metric.amplitude || 0) * wave + jitter;
+      return Math.max(0, Number(value.toFixed(3)));
+    }
+
+    function sumPoint(metric, attrs, elapsedSeconds) {
+      const key = metric.name + JSON.stringify(attrs);
+      const seed = hash(key);
+      // Spread the per-series rate around the configured one.
+      const rate = (metric.ratePerSecond || 1) * (0.6 + ((seed % 100) / 100) * 0.8);
+      const jitter = Math.random() * (metric.jitter || 0);
+      const previous = totals.get(key) || 0;
+      const next = previous + rate * elapsedSeconds + jitter;
+      totals.set(key, next);
+      return Number(next.toFixed(3));
+    }
+
+    function buildPayload(profile, series, elapsedSeconds) {
+      const nowMs = Date.now();
+      const nowNanos = String(nowMs * 1e6);
+      const resourceAttributes = {
+        'service.name': profile.serviceName || 'sc-gen-metric-emitter',
+        // Set these explicitly. Without them the collector attributes the
+        // metrics to the node rather than to this pod, and they do not show up
+        // under the namespace.
+        'k8s.namespace.name': process.env.POD_NAMESPACE,
+        'k8s.pod.name': process.env.POD_NAME,
+        'k8s.pod.uid': process.env.POD_UID,
+        'k8s.node.name': process.env.NODE_NAME,
+      };
+
+      const metrics = profile.metrics.map((metric) => {
+        const dataPoints = series.map((attrs) => ({
+          attributes: attrList(attrs),
+          startTimeUnixNano: START_NANOS,
+          timeUnixNano: nowNanos,
+          asDouble: metric.type === 'sum' ? sumPoint(metric, attrs, elapsedSeconds) : gaugePoint(metric, attrs, nowMs),
+        }));
+        const base = { name: metric.name, unit: metric.unit || '1', description: metric.description || '' };
+        if (metric.type === 'sum') {
+          return {
+            ...base,
+            sum: {
+              dataPoints,
+              aggregationTemporality: 2, // AGGREGATION_TEMPORALITY_CUMULATIVE
+              isMonotonic: true,
+            },
+          };
+        }
+        return { ...base, gauge: { dataPoints } };
+      });
+
+      return {
+        resourceMetrics: [{
+          resource: {
+            attributes: attrList(
+              Object.fromEntries(Object.entries(resourceAttributes).filter(([, v]) => v)),
+            ),
+          },
+          scopeMetrics: [{ scope: { name: 'sc-gen.metric-emitter', version: '1' }, metrics }],
+        }],
+      };
+    }
+
+    const stats = {
+      emitCount: 0,
+      failureCount: 0,
+      lastEmitAt: null,
+      lastStatus: null,
+      lastError: null,
+      lastSeriesCount: 0,
+      lastPointCount: 0,
+    };
+
+    function post(payload) {
+      return new Promise((resolve) => {
+        const body = JSON.stringify(payload);
+        const url = new URL(ENDPOINT);
+        const req = http.request(
+          {
+            host: url.hostname,
+            port: url.port || 80,
+            path: url.pathname,
+            method: 'POST',
+            headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) },
+          },
+          (res) => {
+            let raw = '';
+            res.on('data', (c) => (raw += c));
+            res.on('end', () => {
+              stats.lastStatus = res.statusCode;
+              if (res.statusCode >= 200 && res.statusCode < 300) {
+                stats.emitCount += 1;
+                stats.lastError = null;
+              } else {
+                stats.failureCount += 1;
+                stats.lastError = `${res.statusCode}: ${raw.slice(0, 200)}`;
+              }
+              resolve();
+            });
+          },
+        );
+        req.setTimeout(8000, () => req.destroy(new Error('OTLP request timeout')));
+        req.on('error', (err) => {
+          stats.failureCount += 1;
+          stats.lastStatus = null;
+          stats.lastError = err.message;
+          resolve();
+        });
+        req.write(body);
+        req.end();
+      });
+    }
+
+    let profile;
+    try {
+      profile = readProfile();
+    } catch (err) {
+      log('error', `cannot read ${PROFILE}: ${err.message}`, {});
+      process.exit(1);
+    }
+
+    let series = seriesFor(profile);
+    let timer = null;
+    let lastEmitMs = Date.now();
+
+    log('info', 'metric emitter starting', {
+      endpoint: ENDPOINT,
+      intervalSeconds: profile.intervalSeconds || 10,
+      metrics: profile.metrics.map((m) => m.name),
+      seriesPerMetric: series.length,
+    });
+
+    async function emit() {
+      const now = Date.now();
+      const elapsedSeconds = Math.max(0.001, (now - lastEmitMs) / 1000);
+      lastEmitMs = now;
+      const payload = buildPayload(profile, series, elapsedSeconds);
+      const points = payload.resourceMetrics[0].scopeMetrics[0].metrics
+        .reduce((a, m) => a + ((m.gauge || m.sum).dataPoints.length), 0);
+      await post(payload);
+      stats.lastEmitAt = new Date(now).toISOString();
+      stats.lastSeriesCount = series.length;
+      stats.lastPointCount = points;
+      if (stats.lastError) log('error', `emit failed: ${stats.lastError}`, {});
+    }
+
+    function schedule() {
+      clearInterval(timer);
+      timer = setInterval(emit, Math.max(1000, (profile.intervalSeconds || 10) * 1000));
+    }
+
+    // Do not emit immediately. The collector's k8sattributes processor fills in
+    // pod metadata from an informer cache that is not warm the moment this pod
+    // starts, so the first emit can land without k8s.container.restart_count.
+    // A missing resource attribute changes the resource identity, which splits
+    // every series in two and silently doubles any sum across them. Waiting a
+    // few seconds costs nothing and avoids a confusing duplicate series.
+    const startupDelayMs = Math.max(0, (profile.startupDelaySeconds ?? 20) * 1000);
+    log('info', 'waiting for resource enrichment before the first emit', {
+      startupDelaySeconds: startupDelayMs / 1000,
+    });
+    setTimeout(() => {
+      lastEmitMs = Date.now();
+      emit();
+      schedule();
+    }, startupDelayMs);
+
+    setInterval(() => {
+      try {
+        const next = readProfile();
+        if (JSON.stringify(next) === JSON.stringify(profile)) return;
+        log('info', 'profile changed, reconciling', {});
+        profile = next;
+        series = seriesFor(profile);
+        schedule();
+      } catch (err) {
+        // Keep emitting the previous profile rather than going silent on a bad
+        // edit.
+        log('error', `profile reload failed, keeping previous: ${err.message}`, {});
+      }
+    }, RELOAD_MS);
+
+    // Reported to the control panel so the UI can describe this signal without
+    // a second copy of the profile.
+    function snapshot() {
+      return {
+        ts: new Date().toISOString(),
+        uptimeSeconds: Math.round(process.uptime()),
+        endpoint: ENDPOINT,
+        intervalSeconds: profile.intervalSeconds || 10,
+        startupDelaySeconds: profile.startupDelaySeconds ?? 20,
+        serviceName: profile.serviceName || 'sc-gen-metric-emitter',
+        constantAttributes: profile.constantAttributes || {},
+        dimensions: profile.dimensions || {},
+        seriesPerMetric: series.length,
+        metrics: profile.metrics.map((m) => ({
+          name: m.name,
+          type: m.type || 'gauge',
+          unit: m.unit || '1',
+          description: m.description || '',
+        })),
+        ...stats,
+      };
+    }
+
+    const server = http
+      .createServer((req, res) => {
+        if (req.url.startsWith('/stats')) {
+          res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+          res.end(JSON.stringify(snapshot()));
+          return;
+        }
+        if (req.url.startsWith('/healthz')) {
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          res.end('ok');
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end('{"error":"not_found"}');
+      })
+      .listen(STATS_PORT, () => log('info', `metric-emitter stats on ${STATS_PORT}`, {}));
+
+    // PID 1 in a container gets no default signal disposition, so SIGTERM must
+    // be handled explicitly or the pod hangs for the full grace period.
+    for (const signal of ['SIGTERM', 'SIGINT']) {
+      process.on(signal, () => {
+        log('info', `${signal} received, shutting down`, {});
+        clearInterval(timer);
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 2000).unref();
+      });
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: metric-emitter
+  namespace: sc-test
+  labels:
+    app: metric-emitter
+    # This workload speaks OTLP directly, so it must not be auto-instrumented.
+    dash0.com/enable: "false"
+spec:
+  # The control panel toggles this between 0 and 1.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: metric-emitter
+  template:
+    metadata:
+      labels:
+        app: metric-emitter
+        dash0.com/enable: "false"
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: metric-emitter
+          image: node:22-alpine
+          command: ["node", "/app/emitter.js"]
+          ports:
+            - name: stats
+              containerPort: 8080
+          env:
+            # The node-local collector listens on the host, so the emitter needs
+            # the node IP rather than a cluster Service address.
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+          volumeMounts:
+            - name: src
+              mountPath: /app
+            - name: profile
+              mountPath: /profile
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: stats
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 48Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: src
+          configMap:
+            name: metric-emitter-src
+        - name: profile
+          configMap:
+            name: metric-profile
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metric-emitter
+  namespace: sc-test
+  labels:
+    app: metric-emitter
+spec:
+  selector:
+    app: metric-emitter
+  ports:
+    - name: stats
+      port: 8080
+      targetPort: stats

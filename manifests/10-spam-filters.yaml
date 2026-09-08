@@ -1,0 +1,28 @@
+# Spam filters drop telemetry at the edge, before it leaves the cluster.
+# Target: the ~5/s /health probes and their debug log lines.
+---
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SpamFilter
+metadata:
+  name: drop-health-spans
+  namespace: sc-test
+spec:
+  contexts:
+    - span
+  filter:
+    - key: dash0.operation.name
+      operator: is
+      value: GET /health
+---
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0SpamFilter
+metadata:
+  name: drop-healthcheck-logs
+  namespace: sc-test
+spec:
+  contexts:
+    - log
+  filter:
+    - key: otel.log.body
+      operator: contains
+      value: healthcheck probe served

@@ -1,0 +1,21 @@
+# Tells the Dash0 operator to watch this namespace: auto-instrument every
+# workload in it, and collect container logs and Kubernetes events.
+#
+# `instrumentWorkloads.mode: all` is what injects the Node.js agent into
+# checkout-service without any change to the deployment itself.
+apiVersion: operator.dash0.com/v1beta1
+kind: Dash0Monitoring
+metadata:
+  name: dash0-monitoring
+  namespace: sc-test
+spec:
+  instrumentWorkloads:
+    mode: all
+  logCollection:
+    enabled: true
+  eventCollection:
+    enabled: true
+  # Off because nothing here exposes a Prometheus endpoint. Turn it on if you
+  # add a workload that does.
+  prometheusScraping:
+    enabled: false

@@ -1,0 +1,8 @@
+.DS_Store
+*.local.yaml
+*.local.sh
+.env
+
+# Working notes stay local. This repo is public; the measurements and
+# behavioural notes in docs/ are not for publication.
+docs/

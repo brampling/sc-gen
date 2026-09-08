@@ -1,0 +1,1066 @@
+# A web UI for the test bed: a toggle per generating workload, and a live list
+# of the signals they send with the type, attributes, and Signal Control rules
+# for each one.
+#
+# Reach it with:
+#   kubectl -n sc-test port-forward svc/control-panel 8000:80
+#   open http://localhost:8000
+#
+# Numbered 06 so it deploys ahead of the rules in 10-12. The panel is how you
+# watch each rule land, so it has to already be running and showing an
+# unfiltered baseline before the first rule is applied.
+#
+# It talks to the Kubernetes API with its own ServiceAccount. The Role below is
+# namespaced and grants only what the UI needs: scale the two generating
+# Deployments, read their profiles, read pods, and read the Signal Control rules.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-panel
+  namespace: sc-test
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: control-panel
+  namespace: sc-test
+rules:
+  # Read the generating Deployments to know whether they are on and ready.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["load-generator", "metric-emitter"]
+    verbs: ["get"]
+  # The toggles. Patching the scale subresource is the narrowest way to do it:
+  # it cannot change the image, the command, or anything else about the pod.
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    resourceNames: ["load-generator", "metric-emitter"]
+    verbs: ["get", "patch"]
+  # The traffic and metric definitions, so the signal list is not a second
+  # hardcoded copy.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["load-profile", "metric-profile"]
+    verbs: ["get"]
+  # Pod phase, to distinguish "switched on" from "actually running".
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+  # Read-only. The panel never edits a rule; it only shows which rule targets
+  # which signal.
+  - apiGroups: ["operator.dash0.com"]
+    resources: ["dash0spamfilters", "dash0samplingrules", "dash0signaltometrics"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: control-panel
+  namespace: sc-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: control-panel
+subjects:
+  - kind: ServiceAccount
+    name: control-panel
+    namespace: sc-test
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: control-panel-src
+  namespace: sc-test
+data:
+  server.js: |
+    // Dependency-free control panel. Node stdlib only, so it runs off the stock
+    // node:22-alpine image with no build step and no registry.
+    const http = require('http');
+    const https = require('https');
+    const fs = require('fs');
+
+    const PORT = 8080;
+    const SA = '/var/run/secrets/kubernetes.io/serviceaccount';
+    const K8S_HOST = process.env.KUBERNETES_SERVICE_HOST;
+    const K8S_PORT = process.env.KUBERNETES_SERVICE_PORT_HTTPS || '443';
+    const CA = fs.readFileSync(`${SA}/ca.crt`);
+    const NAMESPACE = process.env.NAMESPACE || fs.readFileSync(`${SA}/namespace`, 'utf8').trim();
+
+    // The two generating workloads. Each has a Deployment to scale, a ConfigMap
+    // holding its profile, and a /stats endpoint reporting what it really did.
+    const WORKLOADS = {
+      'load-generator': {
+        deployment: 'load-generator',
+        configMap: 'load-profile',
+        key: 'profile.json',
+        label: 'Load generator',
+        statsUrl: `http://load-generator.${NAMESPACE}.svc.cluster.local:8080/stats`,
+      },
+      'metric-emitter': {
+        deployment: 'metric-emitter',
+        configMap: 'metric-profile',
+        key: 'profile.json',
+        label: 'Metric emitter',
+        statsUrl: `http://metric-emitter.${NAMESPACE}.svc.cluster.local:8080/stats`,
+      },
+    };
+
+    function log(level, message, extra) {
+      process.stdout.write(JSON.stringify({ level, message, ...extra, ts: new Date().toISOString() }) + '\n');
+    }
+
+    // The projected ServiceAccount token rotates roughly hourly, so read it per
+    // request rather than caching it at startup.
+    function token() {
+      return fs.readFileSync(`${SA}/token`, 'utf8').trim();
+    }
+
+    function k8s(method, path, body) {
+      return new Promise((resolve, reject) => {
+        const payload = body ? JSON.stringify(body) : null;
+        const headers = { Authorization: `Bearer ${token()}`, Accept: 'application/json' };
+        if (payload) {
+          headers['Content-Type'] = 'application/merge-patch+json';
+          headers['Content-Length'] = Buffer.byteLength(payload);
+        }
+        const req = https.request({ host: K8S_HOST, port: K8S_PORT, path, method, headers, ca: CA }, (res) => {
+          let raw = '';
+          res.on('data', (c) => (raw += c));
+          res.on('end', () => {
+            if (res.statusCode < 200 || res.statusCode >= 300) {
+              reject(new Error(`${method} ${path} -> ${res.statusCode}: ${raw.slice(0, 300)}`));
+              return;
+            }
+            try {
+              resolve(JSON.parse(raw));
+            } catch (err) {
+              reject(new Error(`${method} ${path} -> unparseable response: ${err.message}`));
+            }
+          });
+        });
+        req.setTimeout(8000, () => req.destroy(new Error('kubernetes API timeout')));
+        req.on('error', reject);
+        if (payload) req.write(payload);
+        req.end();
+      });
+    }
+
+    function getJson(url) {
+      return new Promise((resolve, reject) => {
+        const req = http.get(url, (res) => {
+          let raw = '';
+          res.on('data', (c) => (raw += c));
+          res.on('end', () => {
+            if (res.statusCode !== 200) {
+              reject(new Error(`${url} -> ${res.statusCode}`));
+              return;
+            }
+            try {
+              resolve(JSON.parse(raw));
+            } catch (err) {
+              reject(err);
+            }
+          });
+        });
+        req.setTimeout(4000, () => req.destroy(new Error('timeout')));
+        req.on('error', reject);
+      });
+    }
+
+    // ---- rule summaries -------------------------------------------------
+    // Turn a rule's spec into one readable line. Deliberately shallow: the
+    // panel describes rules, it does not evaluate OTTL.
+
+    function describeFilters(filters) {
+      return (filters || []).map((f) => `${f.key} ${f.operator} ${JSON.stringify(f.value)}`).join(' AND ');
+    }
+
+    function describeConditions(c) {
+      if (!c || !c.kind) return 'no conditions';
+      switch (c.kind) {
+        case 'error':
+          return 'trace contains an error';
+        case 'probabilistic':
+          return `${Math.round(Number(c.spec && c.spec.rate) * 100)}% of traces`;
+        case 'ottl':
+          return (c.spec && c.spec.ottl) || 'ottl';
+        case 'and':
+          return ((c.spec && c.spec.conditions) || []).map(describeConditions).join(' AND ');
+        case 'or':
+          return ((c.spec && c.spec.conditions) || []).map(describeConditions).join(' OR ');
+        default:
+          return c.kind;
+      }
+    }
+
+    function summarize(kind, item) {
+      const spec = item.spec || {};
+      if (kind === 'Dash0SpamFilter') {
+        return {
+          effect: 'drop',
+          signalTypes: (spec.contexts || []).map((c) => (c === 'span' ? 'traces' : c === 'log' ? 'logs' : c)),
+          detail: `drop ${(spec.contexts || []).join(' + ')} where ${describeFilters(spec.filter)}`,
+        };
+      }
+      if (kind === 'Dash0SamplingRule') {
+        const parts = [describeConditions(spec.conditions)];
+        if (spec.rateLimit && spec.rateLimit.rate) parts.push(`max ${spec.rateLimit.rate}/min`);
+        return {
+          effect: spec.enabled === false ? 'disabled' : 'keep',
+          signalTypes: ['traces'],
+          detail: parts.join(', '),
+        };
+      }
+      if (kind === 'Dash0SignalToMetrics') {
+        const match = spec.match || {};
+        return {
+          effect: spec.enabled === false ? 'disabled' : 'metric',
+          signalTypes: [match.signal === 'spans' ? 'traces' : match.signal || 'unknown'],
+          detail: `${(spec.output && spec.output.name) || '?'} from ${match.signal || '?'} where ${describeFilters(match.filters)}`,
+        };
+      }
+      return { effect: 'unknown', signalTypes: [], detail: '' };
+    }
+
+    async function loadRules() {
+      const kinds = [
+        ['dash0spamfilters', 'Dash0SpamFilter'],
+        ['dash0samplingrules', 'Dash0SamplingRule'],
+        ['dash0signaltometrics', 'Dash0SignalToMetrics'],
+      ];
+      const out = [];
+      for (const [plural, kind] of kinds) {
+        try {
+          const list = await k8s('GET', `/apis/operator.dash0.com/v1alpha1/namespaces/${NAMESPACE}/${plural}`);
+          for (const item of list.items || []) {
+            const { effect, detail, signalTypes } = summarize(kind, item);
+            out.push({
+              kind,
+              name: item.metadata.name,
+              effect,
+              detail,
+              signalTypes,
+              sync: (item.status && item.status.synchronizationStatus) || 'unknown',
+              // Used only for the textual operation match below.
+              specText: JSON.stringify(item.spec || {}),
+            });
+          }
+        } catch (err) {
+          // A missing CRD is a legitimate state: the operator may not be
+          // installed, or Signal Control may be off. Surface it, do not crash.
+          out.push({ kind, name: null, error: err.message });
+        }
+      }
+      return out;
+    }
+
+    // ---- workloads ------------------------------------------------------
+
+    async function readWorkload(id, errors) {
+      const w = WORKLOADS[id];
+      const settle = async (label, fn, fallback) => {
+        try {
+          return await fn();
+        } catch (err) {
+          errors.push(`${id} ${label}: ${err.message}`);
+          return fallback;
+        }
+      };
+
+      const [deployment, configMap, pods, stats] = await Promise.all([
+        settle('deployment', () => k8s('GET', `/apis/apps/v1/namespaces/${NAMESPACE}/deployments/${w.deployment}`), null),
+        settle('profile', () => k8s('GET', `/api/v1/namespaces/${NAMESPACE}/configmaps/${w.configMap}`), null),
+        settle('pods', () => k8s('GET', `/api/v1/namespaces/${NAMESPACE}/pods?labelSelector=app%3D${w.deployment}`), { items: [] }),
+        // Expected to fail whenever the workload is switched off.
+        (async () => {
+          try {
+            return await getJson(w.statsUrl);
+          } catch {
+            return null;
+          }
+        })(),
+      ]);
+
+      const desired = deployment ? (deployment.spec.replicas ?? 0) : 0;
+      const ready = deployment ? (deployment.status.readyReplicas ?? 0) : 0;
+
+      let profile = null;
+      if (configMap && configMap.data && configMap.data[w.key]) {
+        try {
+          profile = JSON.parse(configMap.data[w.key]);
+        } catch (err) {
+          errors.push(`${id} profile ${w.key} is not valid JSON: ${err.message}`);
+        }
+      }
+
+      const podList = (pods.items || []).map((p) => {
+        // A pod with a deletionTimestamp still reports phase Running and its
+        // container still reports ready. Say Terminating instead, so the UI
+        // does not look stuck after a switch goes off.
+        const terminating = Boolean(p.metadata.deletionTimestamp);
+        return {
+          name: p.metadata.name,
+          phase: terminating ? 'Terminating' : p.status.phase,
+          ready: !terminating && ((p.status.containerStatuses || [])[0] || {}).ready === true,
+        };
+      });
+
+      // A pod that is shutting down can still answer /stats for a second or
+      // two. Once the desired replica count is 0 the answer is "off".
+      const trustStats = desired > 0 && stats ? stats : null;
+
+      return {
+        id,
+        label: w.label,
+        deployment: w.deployment,
+        configMap: w.configMap,
+        enabled: desired > 0,
+        desiredReplicas: desired,
+        readyReplicas: ready,
+        settling: desired > 0 && ready === 0,
+        stopping: desired === 0 && podList.some((p) => p.phase === 'Terminating'),
+        reachable: Boolean(trustStats),
+        pods: podList,
+        profile,
+        stats: trustStats,
+      };
+    }
+
+    // ---- signals --------------------------------------------------------
+
+    function httpSignals(workload, scoped) {
+      const statsById = new Map(((workload.stats && workload.stats.streams) || []).map((s) => [s.id, s]));
+      return ((workload.profile && workload.profile.streams) || []).map((s) => {
+        const live = statsById.get(s.id) || null;
+        const emits = s.emits || [];
+        return {
+          id: `http:${s.id}`,
+          source: 'http',
+          workload: workload.id,
+          title: s.operation || s.id,
+          subtitle: s.path,
+          operation: s.operation || null,
+          purpose: s.purpose || null,
+          signalTypes: emits.map((e) => e.signalType),
+          emits,
+          enabledInProfile: s.enabled !== false,
+          // "active" means requests are genuinely being sent right now, not
+          // merely that the profile asks for them.
+          active: Boolean(live && live.observedRatePerSecond > 0),
+          rate: {
+            configured: Number((1000 / (s.intervalMs || 1000)).toFixed(2)),
+            observed: live ? live.observedRatePerSecond : 0,
+            unit: 'req/s',
+          },
+          requestsInWindow: live ? live.requestsInWindow : 0,
+          lastStatus: live ? live.lastStatus : null,
+          lastError: live ? live.lastError : null,
+          // Cumulative since the pod started. Reported separately from
+          // lastError so a healed blip reads as history, not an outage.
+          transportErrors: live ? live.transportErrors : 0,
+          rules: scoped
+            .filter((e) => s.operation && e.operations.includes(s.operation))
+            .map((e) => publicRule(e.rule)),
+          queries: [],
+        };
+      });
+    }
+
+    // PromQL uses underscores where OTLP attribute keys use dots. Surfacing the
+    // converted name saves guessing when querying on the Dash0 side.
+    const promLabel = (key) => key.replace(/[.-]/g, '_');
+
+    function metricSignals(workload) {
+      const stats = workload.stats;
+      const profile = workload.profile;
+      if (!profile) return [];
+      const constant = profile.constantAttributes || {};
+      const dimensions = profile.dimensions || {};
+      const interval = profile.intervalSeconds || 10;
+      const seriesCount = Object.values(dimensions).reduce((a, v) => a * v.length, 1);
+
+      const attributes = [
+        ...Object.entries(constant).map(([key, value]) => ({
+          key,
+          promqlLabel: promLabel(key),
+          example: String(value),
+          constant: true,
+        })),
+        ...Object.entries(dimensions).map(([key, values]) => ({
+          key,
+          promqlLabel: promLabel(key),
+          example: values.join(' | '),
+          cardinality: values.length,
+        })),
+      ];
+
+      const findable = Object.entries(constant)[0] || null;
+      const selector = findable ? `, ${promLabel(findable[0])}="${findable[1]}"` : '';
+
+      return (profile.metrics || []).map((m) => {
+        const live = stats && (stats.metrics || []).some((x) => x.name === m.name);
+        const type = m.type || 'gauge';
+        const groupBy = Object.keys(dimensions)[0];
+        return {
+          id: `metric:${m.name}`,
+          source: 'metric',
+          workload: workload.id,
+          title: m.name,
+          subtitle: `${type === 'sum' ? 'monotonic sum, cumulative' : 'gauge'}${m.unit && m.unit !== '1' ? `, ${m.unit}` : ''}`,
+          operation: null,
+          purpose: m.description || null,
+          signalTypes: ['metrics'],
+          emits: [
+            {
+              signalType: 'metrics',
+              note: `${seriesCount} series, one per attribute combination, emitted every ${interval}s.`
+                + (type === 'sum'
+                  ? ' Cumulative temporality, so use rate() rather than reading the raw value.'
+                  : ''),
+              attributes,
+            },
+          ],
+          enabledInProfile: true,
+          active: Boolean(live && workload.reachable && stats.emitCount > 0 && !stats.lastError),
+          rate: {
+            configured: Number((seriesCount / interval).toFixed(2)),
+            observed: workload.reachable && !stats.lastError ? Number((seriesCount / interval).toFixed(2)) : 0,
+            unit: 'points/s',
+          },
+          requestsInWindow: null,
+          lastStatus: stats ? stats.lastStatus : null,
+          lastError: stats ? stats.lastError : null,
+          // Metrics are not scoped by dash0.operation.name, so no rule matches
+          // them here. Give the PromQL to find them in Dash0 instead.
+          rules: [],
+          queries: [
+            `{otel_metric_name="${m.name}"${selector}}`,
+            type === 'sum'
+              ? `sum by (${promLabel(groupBy || 'job')}) (rate({otel_metric_name="${m.name}"}[5m]))`
+              : `sum by (${promLabel(groupBy || 'job')}) ({otel_metric_name="${m.name}"})`,
+          ],
+        };
+      });
+    }
+
+    // specText is a matching aid, not something the UI should see.
+    const publicRule = ({ specText, ...rest }) => rest;
+
+    async function buildState() {
+      const errors = [];
+      const [loadGen, metricEmitter, rules] = await Promise.all([
+        readWorkload('load-generator', errors),
+        readWorkload('metric-emitter', errors),
+        (async () => {
+          try {
+            return await loadRules();
+          } catch (err) {
+            errors.push(`rules: ${err.message}`);
+            return [];
+          }
+        })(),
+      ]);
+
+      // A rule that names no stream operation is not scoped to one signal, so
+      // it is reported once against the whole test bed rather than repeated on
+      // every row.
+      const operations = ((loadGen.profile && loadGen.profile.streams) || [])
+        .map((s) => s.operation)
+        .filter(Boolean);
+      const scoped = [];
+      const unscoped = [];
+      for (const rule of rules) {
+        if (rule.error) {
+          unscoped.push(rule);
+          continue;
+        }
+        const hits = operations.filter((op) => rule.specText.includes(op));
+        if (hits.length) scoped.push({ rule, operations: hits });
+        else unscoped.push(rule);
+      }
+
+      const signals = [...httpSignals(loadGen, scoped), ...metricSignals(metricEmitter)];
+
+      return {
+        ts: new Date().toISOString(),
+        namespace: NAMESPACE,
+        workloads: { 'load-generator': strip(loadGen), 'metric-emitter': strip(metricEmitter) },
+        totals: {
+          requestsPerSecond: Number(
+            signals.filter((s) => s.source === 'http').reduce((a, s) => a + s.rate.observed, 0).toFixed(2),
+          ),
+          metricPointsPerSecond: Number(
+            signals.filter((s) => s.source === 'metric').reduce((a, s) => a + s.rate.observed, 0).toFixed(2),
+          ),
+          activeSignals: signals.filter((s) => s.active).length,
+          totalSignals: signals.length,
+        },
+        signals,
+        unscopedRules: unscoped.map((r) => (r.error ? r : publicRule(r))),
+        errors,
+      };
+    }
+
+    // The raw profile and stats are large and already reflected in the signal
+    // list, so keep them out of the response.
+    function strip(w) {
+      const { profile, stats, ...rest } = w;
+      return {
+        ...rest,
+        uptimeSeconds: stats ? stats.uptimeSeconds ?? null : null,
+        windowSeconds: stats ? stats.windowSeconds ?? null : null,
+        intervalSeconds: stats ? stats.intervalSeconds ?? null : null,
+        emitCount: stats ? stats.emitCount ?? null : null,
+        failureCount: stats ? stats.failureCount ?? null : null,
+        lastEmitAt: stats ? stats.lastEmitAt ?? null : null,
+        lastError: stats ? stats.lastError ?? null : null,
+      };
+    }
+
+    async function setEnabled(id, enabled) {
+      const w = WORKLOADS[id];
+      const replicas = enabled ? 1 : 0;
+      await k8s('PATCH', `/apis/apps/v1/namespaces/${NAMESPACE}/deployments/${w.deployment}/scale`, {
+        spec: { replicas },
+      });
+      log('info', 'workload scaled', { workload: id, replicas });
+      return replicas;
+    }
+
+    // ---- http -----------------------------------------------------------
+
+    const PAGE = fs.readFileSync('/app/index.html', 'utf8');
+
+    function send(res, code, body, type) {
+      res.writeHead(code, { 'content-type': type, 'cache-control': 'no-store' });
+      res.end(body);
+    }
+
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url, 'http://localhost');
+      try {
+        if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/index.html')) {
+          send(res, 200, PAGE, 'text/html; charset=utf-8');
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/healthz') {
+          send(res, 200, 'ok', 'text/plain');
+          return;
+        }
+        if (req.method === 'GET' && url.pathname === '/api/state') {
+          send(res, 200, JSON.stringify(await buildState()), 'application/json');
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/toggle') {
+          let raw = '';
+          for await (const chunk of req) raw += chunk;
+          let parsed;
+          try {
+            parsed = JSON.parse(raw || '{}');
+          } catch {
+            send(res, 400, '{"error":"body must be JSON"}', 'application/json');
+            return;
+          }
+          const target = parsed.workload || 'load-generator';
+          if (!WORKLOADS[target]) {
+            send(res, 400, JSON.stringify({ error: `unknown workload ${target}` }), 'application/json');
+            return;
+          }
+          if (typeof parsed.enabled !== 'boolean') {
+            send(res, 400, '{"error":"enabled must be true or false"}', 'application/json');
+            return;
+          }
+          const replicas = await setEnabled(target, parsed.enabled);
+          send(res, 200, JSON.stringify({ workload: target, enabled: parsed.enabled, replicas }), 'application/json');
+          return;
+        }
+        send(res, 404, '{"error":"not_found"}', 'application/json');
+      } catch (err) {
+        log('error', `request failed: ${err.message}`, { path: url.pathname });
+        send(res, 500, JSON.stringify({ error: err.message }), 'application/json');
+      }
+    });
+
+    server.listen(PORT, () => log('info', `control-panel listening on ${PORT}`, { namespace: NAMESPACE }));
+
+    // PID 1 gets no default signal disposition, so handle SIGTERM explicitly or
+    // the pod sits in Terminating for the full grace period on every redeploy.
+    for (const signal of ['SIGTERM', 'SIGINT']) {
+      process.on(signal, () => {
+        log('info', `${signal} received, shutting down`, {});
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 2000).unref();
+      });
+    }
+  index.html: |
+    <!doctype html>
+    <html lang="en">
+    <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Signal Control test bed</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #fbfbfa;
+        --panel: #ffffff;
+        --border: #e4e4e1;
+        --inset: #f5f5f3;
+        --text: #1b1b19;
+        --muted: #6b6b66;
+        --accent: #2f6f4f;
+        --off: #b8b8b2;
+        --drop: #a33a2c;
+        --keep: #2f6f4f;
+        --metric: #3d5a99;
+        --warn: #8a6216;
+        --traces: #6b4f9e;
+        --logs: #1f6f7a;
+        --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #16171a;
+          --panel: #1d1f23;
+          --border: #2e3138;
+          --inset: #24272c;
+          --text: #e8e8e6;
+          --muted: #9a9a94;
+          --accent: #4c9c72;
+          --off: #4a4d54;
+          --drop: #e08472;
+          --keep: #79c79b;
+          --metric: #8fa9e0;
+          --warn: #d9ab5a;
+          --traces: #b39ae0;
+          --logs: #6fc4cf;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        padding: 32px 20px 64px;
+      }
+      main { max-width: 980px; margin: 0 auto; }
+      h1 { font-size: 20px; margin: 0 0 4px; font-weight: 600; }
+      .sub { color: var(--muted); margin: 0 0 24px; font-size: 13px; }
+      code { font-family: var(--mono); font-size: 12px; }
+
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 18px 20px;
+        margin-bottom: 20px;
+      }
+
+      /* toggles */
+      .toggle-row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+      .toggle-row + .toggle-row { border-top: 1px solid var(--border); margin-top: 16px; padding-top: 16px; }
+      .switch { position: relative; flex: none; width: 52px; height: 30px; }
+      .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+      .track {
+        position: absolute; inset: 0; background: var(--off); border-radius: 999px;
+        transition: background 160ms ease; pointer-events: none;
+      }
+      .track::after {
+        content: ""; position: absolute; top: 3px; left: 3px; width: 24px; height: 24px;
+        background: #fff; border-radius: 50%; transition: transform 160ms ease;
+        box-shadow: 0 1px 3px rgba(0,0,0,.3);
+      }
+      .switch input:checked + .track { background: var(--accent); }
+      .switch input:checked + .track::after { transform: translateX(22px); }
+      .switch input:focus-visible + .track { outline: 2px solid var(--accent); outline-offset: 2px; }
+      .switch input:disabled + .track { opacity: .5; }
+      .switch input:disabled { cursor: wait; }
+
+      .toggle-label { font-size: 15px; font-weight: 600; }
+      .toggle-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+      .rate { margin-left: auto; text-align: right; flex: none; }
+      .rate b { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .rate span { display: block; color: var(--muted); font-size: 12px; }
+
+      h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+      .note { color: var(--muted); font-size: 12px; margin: -2px 0 12px; max-width: 78ch; }
+
+      /* Each signal is a <details>. Collapsed it shows only the activity dot,
+         the name, and the signal-type badges -- enough to go find it in Dash0.
+         Everything else lives in .signal-body. */
+      .signal { border-top: 1px solid var(--border); }
+      .signal:first-of-type { border-top: 0; }
+      .signal > summary {
+        cursor: pointer; list-style: none; padding: 11px 0;
+        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      }
+      .signal > summary::-webkit-details-marker { display: none; }
+      /* Chevron drawn from two borders on a rotated box rather than a glyph:
+         it scales to whatever size we want, stays crisp, and rotates to point
+         down when the row opens. */
+      .signal > summary::before {
+        content: ""; flex: none;
+        width: 9px; height: 9px; margin: 0 2px;
+        border-right: 2px solid var(--muted);
+        border-bottom: 2px solid var(--muted);
+        border-radius: 0 0 2px 0;
+        transform: rotate(-45deg);
+        transition: transform 150ms ease, border-color 150ms ease;
+      }
+      .signal[open] > summary::before { transform: rotate(45deg); }
+      .signal > summary:hover::before { border-color: var(--accent); }
+      .signal > summary:hover .title { color: var(--accent); }
+      .signal > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+      .signal-body { padding-bottom: 14px; }
+      .signal-meta { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin-left: 18px; }
+      .dot { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--off); }
+      .dot.on { background: var(--accent); }
+      .title { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+      .subtitle { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+      .nums { margin-left: auto; font-variant-numeric: tabular-nums; font-size: 13px; flex: none; }
+      .nums .drift { color: var(--warn); }
+      .purpose { color: var(--muted); font-size: 13px; margin: 6px 0 0 18px; }
+
+      .tag {
+        flex: none; font-size: 10px; font-weight: 700; text-transform: uppercase;
+        letter-spacing: .04em; padding: 2px 6px; border-radius: 4px; border: 1px solid currentColor;
+      }
+      .tag.traces { color: var(--traces); }
+      .tag.logs { color: var(--logs); }
+      .tag.metrics { color: var(--metric); }
+      .tag.drop { color: var(--drop); }
+      .tag.keep { color: var(--keep); }
+      .tag.metric { color: var(--metric); }
+      .tag.disabled, .tag.unknown { color: var(--muted); }
+
+      /* The attribute list used to sit behind its own nested <details>. Now
+         that the whole signal collapses, a second click to reach it would be
+         one too many, so render it inline with a caption instead. */
+      .attr-caption { color: var(--muted); font-size: 12px; margin: 10px 0 0 18px; }
+      .emits { margin-left: 18px; }
+
+      .emit { background: var(--inset); border-radius: 6px; padding: 10px 12px; margin-top: 8px; }
+      .emit-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; flex-wrap: wrap; }
+      .emit-note { color: var(--muted); font-size: 12px; }
+      table.attrs { border-collapse: collapse; width: 100%; margin-top: 6px; }
+      table.attrs td { padding: 2px 8px 2px 0; vertical-align: top; font-size: 12px; }
+      table.attrs td.k { font-family: var(--mono); white-space: nowrap; }
+      table.attrs td.p { font-family: var(--mono); color: var(--muted); white-space: nowrap; }
+      table.attrs td.v { font-family: var(--mono); color: var(--muted); }
+      .card-badge { font-size: 10px; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
+
+      .rules { margin: 8px 0 0 18px; display: flex; flex-direction: column; gap: 4px; }
+      .rule { font-size: 12px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+      .rule-name { font-weight: 600; }
+      .rule-detail { font-family: var(--mono); color: var(--muted); font-size: 11px; }
+      .no-rule { font-size: 12px; color: var(--warn); margin: 8px 0 0 18px; }
+      .unsynced { color: var(--warn); font-size: 11px; }
+      .queries { margin: 8px 0 0 18px; display: flex; flex-direction: column; gap: 4px; }
+      .queries code {
+        display: block; background: var(--inset); border-radius: 4px;
+        padding: 5px 8px; overflow-x: auto; white-space: pre;
+      }
+
+      .empty { color: var(--muted); font-style: italic; }
+      .errors { border-color: var(--warn); }
+      .errors li { font-family: var(--mono); font-size: 12px; }
+      footer { color: var(--muted); font-size: 12px; text-align: center; }
+      .stale { opacity: .55; transition: opacity 200ms; }
+    </style>
+    </head>
+    <body>
+    <main>
+      <h1>Signal Control test bed</h1>
+      <p class="sub">Namespace <code id="ns">…</code>. Traffic comes from the <code>load-profile</code> ConfigMap, metrics from <code>metric-profile</code>.</p>
+
+      <div class="card" id="toggles"></div>
+
+      <div class="card">
+        <h2 id="signals-heading">Signals</h2>
+        <p class="note">Each row is one signal the test bed produces, collapsed to its name and OTLP signal type so the list stays scannable. A filled dot means it is emitting now. Expand a row for its rate, attributes, matching rules and ready-made queries. RED metrics (<code>dash0.spans.red</code>) are derived from spans by the collector and are not listed here.</p>
+        <div id="signals"><p class="empty">Loading…</p></div>
+      </div>
+
+      <div class="card" id="global-card" hidden>
+        <h2>Rules not attributed to a signal</h2>
+        <p class="note">Signals are matched to rules by looking for the signal's <code>dash0.operation.name</code> in the rule spec. These rules name no operation, so they cannot be attributed automatically. They still apply.</p>
+        <div id="global-rules"></div>
+      </div>
+
+      <div class="card errors" id="error-card" hidden>
+        <h2>Problems</h2>
+        <ul id="errors"></ul>
+      </div>
+
+      <footer id="footer">—</footer>
+    </main>
+
+    <script>
+    const $ = (id) => document.getElementById(id);
+    const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const pending = new Set();
+
+    function ruleRow(r) {
+      const sync = r.sync && r.sync !== 'successful'
+        ? ` <span class="unsynced">sync: ${esc(r.sync)}</span>` : '';
+      const types = (r.signalTypes || []).map((t) => `<span class="tag ${esc(t)}">${esc(t)}</span>`).join('');
+      return `<div class="rule">
+        <span class="tag ${esc(r.effect)}">${esc(r.effect)}</span>
+        <span class="rule-name">${esc(r.name)}</span>
+        ${types}
+        <span class="rule-detail">${esc(r.detail)}</span>${sync}
+      </div>`;
+    }
+
+    function attrTable(attrs) {
+      const hasProm = attrs.some((a) => a.promqlLabel && a.promqlLabel !== a.key);
+      return `<table class="attrs">${attrs.map((a) => `<tr>
+        <td class="k">${esc(a.key)}</td>
+        ${hasProm ? `<td class="p">${a.promqlLabel && a.promqlLabel !== a.key ? esc(a.promqlLabel) : ''}</td>` : ''}
+        <td class="v">${esc(a.example)}${a.cardinality ? ` <span class="card-badge">${a.cardinality} values</span>` : ''}</td>
+      </tr>`).join('')}</table>`;
+    }
+
+    function emitBlock(e) {
+      return `<div class="emit">
+        <div class="emit-head">
+          <span class="tag ${esc(e.signalType)}">${esc(e.signalType)}</span>
+          <span class="emit-note">${esc(e.note)}</span>
+        </div>
+        ${e.attributes && e.attributes.length ? attrTable(e.attributes) : '<p class="empty">No attributes declared.</p>'}
+      </div>`;
+    }
+
+    function signalRow(s) {
+      const types = s.signalTypes.map((t) => `<span class="tag ${esc(t)}">${esc(t)}</span>`).join('');
+      // Flag an http stream whose observed rate has drifted well away from the
+      // configured rate: that usually means the generator is throttled or the
+      // target is slow, not that a Signal Control rule did something.
+      const drift = s.source === 'http' && s.active
+        && Math.abs(s.rate.observed - s.rate.configured) > s.rate.configured * 0.35;
+      const nums = s.active
+        ? `<b>${s.rate.observed}</b> ${esc(s.rate.unit)}${s.source === 'http' ? ` <span class="${drift ? 'drift' : ''}">(configured ${s.rate.configured})</span>` : ''}`
+        : `<span class="empty">idle</span>`;
+
+      const rules = s.source === 'metric'
+        ? ''
+        : s.rules.length
+          ? `<div class="rules">${s.rules.map(ruleRow).join('')}</div>`
+          : `<p class="no-rule">No rule names this signal. Its traces survive only if an unattributed rule below keeps them, such as a baseline probabilistic rule.</p>`;
+
+      const queries = s.queries && s.queries.length
+        ? `<div class="queries">${s.queries.map((q) => `<code>${esc(q)}</code>`).join('')}</div>`
+        : '';
+
+      const what = s.source === 'metric' ? 'emit' : 'request';
+      const err = s.lastError
+        ? `<p class="no-rule">Last ${what} failed: ${esc(s.lastError)}</p>`
+        : s.transportErrors
+          ? `<p class="purpose">Recovered. ${s.transportErrors} failed ${s.transportErrors === 1 ? 'request' : 'requests'} since this pod started.</p>`
+          : '';
+      const disabled = s.enabledInProfile ? '' : ' <span class="empty">— disabled in profile</span>';
+      const attrCount = s.emits.reduce((a, e) => a + ((e.attributes || []).length), 0);
+
+      const attrs = s.emits.length
+        ? `<p class="attr-caption">${attrCount} attributes across ${s.emits.length} signal ${s.emits.length === 1 ? 'type' : 'types'}</p>
+           <div class="emits">${s.emits.map(emitBlock).join('')}</div>`
+        : '';
+
+      // The summary carries only the dot, the name and the type badges. The
+      // dot stays because knowing which signals are live at a glance is the
+      // whole point of the list; everything else is detail.
+      return `<details class="signal" data-signal="${esc(s.id)}">
+        <summary>
+          <span class="dot ${s.active ? 'on' : ''}"></span>
+          <span class="title">${esc(s.title)}</span>
+          ${types}
+        </summary>
+        <div class="signal-body">
+          <div class="signal-meta">
+            <span class="subtitle">${esc(s.subtitle)}</span>${disabled}
+            <span class="nums">${nums}</span>
+          </div>
+          ${s.purpose ? `<p class="purpose">${esc(s.purpose)}</p>` : ''}
+          ${err}
+          ${attrs}
+          ${queries}
+          ${rules}
+        </div>
+      </details>`;
+    }
+
+    function toggleRow(w, totals) {
+      let meta;
+      if (w.stopping) meta = 'Stopping. The pod is shutting down.';
+      else if (!w.enabled) meta = 'Off. 0 replicas.';
+      else if (w.settling) meta = 'Starting. The pod is not ready yet.';
+      else if (!w.reachable) meta = 'Running, but the stats endpoint is not answering yet.';
+      else if (w.id === 'metric-emitter') {
+        meta = `Running for ${w.uptimeSeconds}s. ${w.emitCount} emits every ${w.intervalSeconds}s`
+          + (w.failureCount ? `, ${w.failureCount} failed.` : ', none failed.');
+      } else {
+        meta = `Running for ${w.uptimeSeconds}s. Rates averaged over the last ${w.windowSeconds}s.`;
+      }
+      const pods = w.pods.map((p) => `${p.name} (${p.phase}${p.ready ? ', ready' : ''})`).join(', ');
+      const value = w.id === 'metric-emitter' ? totals.metricPointsPerSecond : totals.requestsPerSecond;
+      const unit = w.id === 'metric-emitter' ? 'metric points/sec' : 'requests/sec observed';
+      return `<div class="toggle-row">
+        <label class="switch">
+          <input type="checkbox" data-workload="${esc(w.id)}" ${w.enabled ? 'checked' : ''} ${pending.has(w.id) ? 'disabled' : ''}>
+          <span class="track"></span>
+        </label>
+        <div>
+          <div class="toggle-label">${esc(w.label)}</div>
+          <div class="toggle-meta">${esc(pods ? `${meta} ${pods}` : meta)}</div>
+        </div>
+        <div class="rate">
+          <b>${w.reachable ? value : '—'}</b>
+          <span>${unit}</span>
+        </div>
+      </div>`;
+    }
+
+    function render(st) {
+      $('ns').textContent = st.namespace;
+
+      $('toggles').innerHTML = Object.values(st.workloads).map((w) => toggleRow(w, st.totals)).join('');
+      for (const input of document.querySelectorAll('#toggles input[data-workload]')) {
+        input.addEventListener('change', onToggle);
+      }
+
+      $('signals-heading').textContent = st.signals.length
+        ? `Signals — ${st.totals.activeSignals ? `${st.totals.activeSignals} of ${st.totals.totalSignals} active` : 'none active'}`
+        : 'Signals';
+      $('signals').innerHTML = st.signals.length
+        ? st.signals.map(signalRow).join('')
+        : '<p class="empty">No signals declared in either profile.</p>';
+
+      const globals = st.unscopedRules.filter((r) => !r.error);
+      $('global-card').hidden = globals.length === 0;
+      $('global-rules').innerHTML = `<div class="rules">${globals.map(ruleRow).join('')}</div>`;
+
+      const errs = [...st.errors, ...st.unscopedRules.filter((r) => r.error).map((r) => `${r.kind}: ${r.error}`)];
+      $('error-card').hidden = errs.length === 0;
+      $('errors').innerHTML = errs.map((e) => `<li>${esc(e)}</li>`).join('');
+
+      $('footer').textContent = `Updated ${new Date(st.ts).toLocaleTimeString()}`;
+      document.body.classList.remove('stale');
+    }
+
+    // Keep expanded signals expanded across the 3s repaint, or reading a long
+    // attribute list would be impossible. Keyed on the signal id from the API,
+    // which is stable even if the title or the ordering changes.
+    function openIds() {
+      return new Set([...document.querySelectorAll('#signals .signal[open]')]
+        .map((d) => d.dataset.signal));
+    }
+    function restoreOpen(ids) {
+      for (const d of document.querySelectorAll('#signals .signal')) {
+        if (ids.has(d.dataset.signal)) d.open = true;
+      }
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch('/api/state');
+        if (!res.ok) throw new Error(`state -> ${res.status}`);
+        const open = openIds();
+        render(await res.json());
+        restoreOpen(open);
+      } catch (err) {
+        document.body.classList.add('stale');
+        $('footer').textContent = `Cannot reach the control panel: ${err.message}`;
+      }
+    }
+
+    async function onToggle(e) {
+      const workload = e.target.dataset.workload;
+      const enabled = e.target.checked;
+      pending.add(workload);
+      e.target.disabled = true;
+      try {
+        const res = await fetch('/api/toggle', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ workload, enabled }),
+        });
+        if (!res.ok) throw new Error((await res.json()).error || res.status);
+      } catch (err) {
+        e.target.checked = !enabled;
+        $('footer').textContent = `Toggle failed: ${err.message}`;
+      } finally {
+        pending.delete(workload);
+        poll();
+      }
+    }
+
+    poll();
+    setInterval(poll, 3000);
+    </script>
+    </body>
+    </html>
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-panel
+  namespace: sc-test
+  labels:
+    app: control-panel
+    # Infrastructure for the test bed, not part of the telemetry under test.
+    dash0.com/enable: "false"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: control-panel
+  template:
+    metadata:
+      labels:
+        app: control-panel
+        dash0.com/enable: "false"
+    spec:
+      serviceAccountName: control-panel
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: control-panel
+          image: node:22-alpine
+          command: ["node", "/app/server.js"]
+          ports:
+            - name: http
+              containerPort: 8080
+          volumeMounts:
+            - name: src
+              mountPath: /app
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 48Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: src
+          configMap:
+            name: control-panel-src
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-panel
+  namespace: sc-test
+  labels:
+    app: control-panel
+spec:
+  selector:
+    app: control-panel
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

@@ -1,0 +1,12 @@
+# The namespace everything else in this repo lives in.
+#
+# `kubectl apply` is idempotent, so applying this against a cluster that already
+# has the namespace is a no-op. If you want to run the test bed in a different
+# namespace, change the name here and in every other manifest, and set
+# NAMESPACE when you run ./verify.sh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sc-test
+  labels:
+    app.kubernetes.io/part-of: sc-gen

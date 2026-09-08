@@ -1,0 +1,279 @@
+# The load generator. Reads manifests/03-load-profile.yaml, drives one loop per
+# stream, and reports what it actually sent on GET /stats.
+#
+# Labelled dash0.com/enable: "false" so the operator leaves it uninstrumented.
+# That matters twice over: only checkout-service spans reach Signal Control, and
+# the generator's own /stats endpoint produces no telemetry of its own.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: load-generator-src
+  namespace: sc-test
+data:
+  generator.js: |
+    // Dependency-free load generator. Node's stdlib only, so it runs straight
+    // off the stock node:22-alpine image with no build and no registry.
+    const http = require('http');
+    const fs = require('fs');
+
+    const PROFILE = '/profile/profile.json';
+    const STATS_PORT = 8080;
+    const RELOAD_MS = 10000;
+    const WINDOW_MS = 60000;
+
+    function log(level, message, extra) {
+      process.stdout.write(JSON.stringify({ level, message, ...extra, ts: new Date().toISOString() }) + '\n');
+    }
+
+    // One entry per stream id. Kept across reloads so the observed rate does
+    // not reset every time the profile is re-read.
+    const state = new Map();
+
+    function readProfile() {
+      const parsed = JSON.parse(fs.readFileSync(PROFILE, 'utf8'));
+      if (!parsed.target) throw new Error('profile has no target');
+      if (!Array.isArray(parsed.streams)) throw new Error('profile has no streams array');
+      return parsed;
+    }
+
+    function expand(path) {
+      return path.replace(/\{rand\}/g, () => String(Math.floor(Math.random() * 1e6)));
+    }
+
+    // Rolling window of request timestamps, so /stats can report the rate we
+    // are really achieving rather than the rate the profile asked for.
+    function record(entry, statusCode, error) {
+      const now = Date.now();
+      entry.hits.push(now);
+      const cutoff = now - WINDOW_MS;
+      while (entry.hits.length && entry.hits[0] < cutoff) entry.hits.shift();
+      entry.total += 1;
+      if (error) {
+        entry.errors += 1;
+        entry.lastError = error;
+      } else {
+        entry.lastStatus = statusCode;
+        if (statusCode >= 500) entry.serverErrors += 1;
+        // Clear it. A sticky lastError would keep reporting a transient failure
+        // from a restart long after traffic recovered, which reads as an
+        // ongoing outage in the control panel.
+        entry.lastError = null;
+      }
+      entry.lastAt = now;
+    }
+
+    function fire(entry) {
+      const url = new URL(expand(entry.stream.path), entry.target);
+      const req = http.request(
+        { host: url.hostname, port: url.port || 80, path: url.pathname + url.search, method: 'GET' },
+        (res) => {
+          res.resume();
+          res.on('end', () => record(entry, res.statusCode, null));
+        },
+      );
+      req.setTimeout(5000, () => req.destroy(new Error('timeout')));
+      req.on('error', (err) => record(entry, null, err.message));
+      req.end();
+    }
+
+    // Each stream runs on its own self-rescheduling timer. Reconcile stops the
+    // timers for streams that were removed or disabled and starts the rest, so
+    // a profile edit takes effect without a restart.
+    function reconcile(profile) {
+      const wanted = new Map(profile.streams.filter((s) => s.enabled !== false).map((s) => [s.id, s]));
+
+      for (const [id, entry] of state) {
+        if (!wanted.has(id)) {
+          clearTimeout(entry.timer);
+          state.delete(id);
+          log('info', 'stream stopped', { stream: id });
+        }
+      }
+
+      for (const [id, stream] of wanted) {
+        const existing = state.get(id);
+        if (existing) {
+          existing.stream = stream;
+          existing.target = profile.target;
+          continue;
+        }
+        const entry = {
+          stream,
+          target: profile.target,
+          hits: [],
+          total: 0,
+          errors: 0,
+          serverErrors: 0,
+          lastStatus: null,
+          lastError: null,
+          lastAt: null,
+          startedAt: Date.now(),
+          timer: null,
+        };
+        const tick = () => {
+          fire(entry);
+          entry.timer = setTimeout(tick, Math.max(10, entry.stream.intervalMs || 1000));
+        };
+        state.set(id, entry);
+        log('info', 'stream started', { stream: id, path: stream.path, intervalMs: stream.intervalMs });
+        tick();
+      }
+    }
+
+    function snapshot() {
+      const now = Date.now();
+      return {
+        ts: new Date(now).toISOString(),
+        uptimeSeconds: Math.round(process.uptime()),
+        windowSeconds: WINDOW_MS / 1000,
+        streams: [...state.values()].map((e) => {
+          // Rate over the window, or over the uptime while still filling it.
+          const elapsed = Math.min(WINDOW_MS, now - e.startedAt) / 1000;
+          return {
+            id: e.stream.id,
+            path: e.stream.path,
+            operation: e.stream.operation || null,
+            purpose: e.stream.purpose || null,
+            intervalMs: e.stream.intervalMs || 1000,
+            configuredRatePerSecond: Number((1000 / (e.stream.intervalMs || 1000)).toFixed(2)),
+            observedRatePerSecond: elapsed > 0 ? Number((e.hits.length / elapsed).toFixed(2)) : 0,
+            requestsInWindow: e.hits.length,
+            totalRequests: e.total,
+            transportErrors: e.errors,
+            serverErrors: e.serverErrors,
+            lastStatus: e.lastStatus,
+            lastError: e.lastError,
+            lastRequestAt: e.lastAt ? new Date(e.lastAt).toISOString() : null,
+          };
+        }),
+      };
+    }
+
+    let profile;
+    try {
+      profile = readProfile();
+    } catch (err) {
+      log('error', `cannot read ${PROFILE}: ${err.message}`, {});
+      process.exit(1);
+    }
+    reconcile(profile);
+
+    setInterval(() => {
+      try {
+        const next = readProfile();
+        const changed = JSON.stringify(next) !== JSON.stringify(profile);
+        if (changed) {
+          log('info', 'profile changed, reconciling', {});
+          profile = next;
+          reconcile(profile);
+        }
+      } catch (err) {
+        // Keep the current streams running rather than stopping traffic
+        // because of a bad edit.
+        log('error', `profile reload failed, keeping previous: ${err.message}`, {});
+      }
+    }, RELOAD_MS);
+
+    const server = http
+      .createServer((req, res) => {
+        if (req.url.startsWith('/stats')) {
+          res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+          res.end(JSON.stringify(snapshot()));
+          return;
+        }
+        if (req.url.startsWith('/healthz')) {
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          res.end('ok');
+          return;
+        }
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end('{"error":"not_found"}');
+      })
+      .listen(STATS_PORT, () => log('info', `load-generator stats on ${STATS_PORT}`, {}));
+
+    // This process is PID 1 in the container, and the kernel does not apply
+    // default signal dispositions to PID 1. Without these handlers SIGTERM is
+    // ignored, the pod sits in Terminating for the whole grace period, and the
+    // control panel's off switch appears not to work. Handle it explicitly.
+    for (const signal of ['SIGTERM', 'SIGINT']) {
+      process.on(signal, () => {
+        log('info', `${signal} received, stopping streams`, {});
+        for (const entry of state.values()) clearTimeout(entry.timer);
+        state.clear();
+        server.close(() => process.exit(0));
+        // Do not wait on a lingering keep-alive connection.
+        setTimeout(() => process.exit(0), 2000).unref();
+      });
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: load-generator
+  namespace: sc-test
+  labels:
+    app: load-generator
+    # The load generator itself is not interesting telemetry; keep it out of
+    # instrumentation so only checkout-service spans reach Signal Control.
+    dash0.com/enable: "false"
+spec:
+  # The control panel toggles this between 0 and 1.
+  replicas: 1
+  selector:
+    matchLabels:
+      app: load-generator
+  template:
+    metadata:
+      labels:
+        app: load-generator
+        dash0.com/enable: "false"
+    spec:
+      # The generator stops on SIGTERM, so it does not need the default 30s.
+      # Keeps the control panel's off switch feeling immediate.
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: load-generator
+          image: node:22-alpine
+          command: ["node", "/app/generator.js"]
+          ports:
+            - name: stats
+              containerPort: 8080
+          volumeMounts:
+            - name: src
+              mountPath: /app
+            - name: profile
+              mountPath: /profile
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: stats
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 20m
+              memory: 48Mi
+            limits:
+              memory: 128Mi
+      volumes:
+        - name: src
+          configMap:
+            name: load-generator-src
+        - name: profile
+          configMap:
+            name: load-profile
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: load-generator
+  namespace: sc-test
+  labels:
+    app: load-generator
+spec:
+  selector:
+    app: load-generator
+  ports:
+    - name: stats
+      port: 8080
+      targetPort: stats
