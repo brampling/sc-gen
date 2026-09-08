@@ -164,11 +164,26 @@ kubectl -n dash0-system rollout status \
 kubectl get pods -n dash0-system
 ```
 
-The `get pods` is worth running: it shows the four new pods the two
-Deployments just created alongside the controller that was already there, so
-you can see what enabling Signal Control actually added.
+The `get pods` is the point of running this as two steps. Compare the full
+list against [the one from step 3](#3-install-the-operator-with-signal-control-enabled):
+the three operator workloads are unchanged, and everything marked below is new
+since applying the resource above.
 
-Nothing downstream works until both are running.
+```
+dash0-operator-controller-...                              Running
+dash0-operator-cluster-metrics-collector-deployment-...    Running
+dash0-operator-opentelemetry-collector-agent-daemonset-... Running
+dash0-operator-edge-proxy-...                              Running   <- new
+dash0-operator-edge-proxy-...                              Running   <- new
+dash0-operator-signal-control-collector-deployment-...     Running   <- new
+dash0-operator-signal-control-collector-deployment-...     Running   <- new
+```
+
+Four new pods, two per Deployment. That is the whole visible effect of the
+`Dash0SignalControl` resource: the Helm flag in step 3 changed nothing in the
+cluster, and applying six lines of YAML is what actually built the pipeline.
+
+Nothing downstream works until both Deployments are running.
 
 #### Pinning the Signal Control images to 1.1.0
 
