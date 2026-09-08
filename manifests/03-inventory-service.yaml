@@ -1,0 +1,119 @@
+# The inventory service. Serves the one call checkout-service makes downstream.
+#
+# This exists so /checkout produces a genuinely distributed trace across two
+# services rather than a trace that loops back to its own port. The span count,
+# the operation names and the attributes are all unchanged from when
+# checkout-service served /inventory itself -- the only difference is that the
+# /inventory SERVER span now carries service.name="inventory-service", which is
+# what lets Dash0 draw a checkout-service -> inventory-service edge in the
+# service map.
+#
+# Numbered 03, straight after checkout-service, because the two are one request
+# path. There is no ordering requirement between them: checkout-service retries
+# per request, so whichever comes up second just ends the brief window where
+# /checkout returns 500.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inventory-service-src
+  namespace: sc-test
+data:
+  server.js: |
+    const http = require('http');
+
+    const PORT = 8080;
+
+    function log(level, message, extra) {
+      process.stdout.write(JSON.stringify({
+        level,
+        message,
+        ...extra,
+        ts: new Date().toISOString(),
+      }) + '\n');
+    }
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    const server = http.createServer(async (req, res) => {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+      const path = url.pathname;
+
+      try {
+        if (path === '/inventory') {
+          // Deliberately silent. This handler used to live in
+          // checkout-service and logged nothing, and keeping it that way means
+          // moving it here changes no log volume -- so the spam-filter step
+          // still measures exactly what it measured before.
+          await sleep(20 + Math.random() * 40);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ sku: url.searchParams.get('sku'), inStock: true }));
+          return;
+        }
+
+        res.writeHead(404, { 'content-type': 'application/json' });
+        res.end('{"error":"not_found"}');
+      } catch (err) {
+        log('error', `unhandled error: ${err.message}`, { endpoint: path });
+        res.writeHead(500);
+        res.end('{"error":"internal"}');
+      }
+    });
+
+    server.listen(PORT, () => log('info', `inventory-service listening on ${PORT}`, {}));
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: inventory-service
+  namespace: sc-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: inventory-service
+  template:
+    metadata:
+      labels:
+        app: inventory-service
+    spec:
+      containers:
+        - name: inventory-service
+          image: node:22-alpine
+          command: ["node", "/app/server.js"]
+          env:
+            - name: OTEL_SERVICE_NAME
+              value: inventory-service
+            # service.namespace is what groups the services into one
+            # application in the Dash0 catalog and map. Every workload here
+            # that emits telemetry sets the same value.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=sc-gen,deployment.environment.name=lab
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: src
+              mountPath: /app
+          resources:
+            requests:
+              cpu: 25m
+              memory: 96Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: src
+          configMap:
+            name: inventory-service-src
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: inventory-service
+  namespace: sc-test
+spec:
+  selector:
+    app: inventory-service
+  ports:
+    - port: 8080
+      targetPort: 8080

@@ -1,4 +1,4 @@
-# The load generator. Reads manifests/03-load-profile.yaml, drives one loop per
+# The load generator. Reads manifests/04-load-profile.yaml, drives one loop per
 # stream, and reports what it actually sent on GET /stats.
 #
 # Labelled dash0.com/enable: "false" so the operator leaves it uninstrumented.

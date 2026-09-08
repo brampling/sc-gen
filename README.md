@@ -307,7 +307,7 @@ it starts with no rules so each one is visible as you add it.
 
 1. Apply everything. The filename prefixes give the right order, and
    `kubectl apply` walks the directory alphabetically: the workload and control
-   panel in `00` to `06`, then the rules in `10` to `12`.
+   panel in `00` to `07`, then the rules in `10` to `12`.
 
    ```bash
    kubectl apply -f manifests/
@@ -317,6 +317,7 @@ it starts with no rules so each one is visible as you add it.
 
    ```bash
    kubectl -n sc-test rollout status deploy/checkout-service
+   kubectl -n sc-test rollout status deploy/inventory-service
    kubectl -n sc-test rollout status deploy/load-generator
    kubectl -n sc-test rollout status deploy/metric-emitter
    kubectl -n sc-test rollout status deploy/control-panel
@@ -351,8 +352,8 @@ like without them. This walkthrough starts a fresh cluster and a fresh Dash0
 org, gets traffic flowing with **no rules at all**, then adds each rule kind as
 its own step so you can watch it take effect.
 
-The manifests are numbered for exactly this. `00` through `06` are the workload
-and the control panel; `10` through `12` are the rules. Nothing in `00-06`
+The manifests are numbered for exactly this. `00` through `07` are the workload
+and the control panel; `10` through `12` are the rules. Nothing in `00-07`
 depends on a rule existing.
 
 ### Step 1: the operator and Signal Control — no manifests
@@ -366,18 +367,19 @@ When install step 5 reports `"status":"True","reason":"ReconcileFinished"` and
 `"signalControlEdge":{"enabled":true}`, you have a cluster producing no telemetry yet, with
 Signal Control armed and no rules. That is the starting line.
 
-### Step 2: traffic, with no rules — `00` to `06`
+### Step 2: traffic, with no rules — `00` to `07`
 
 ```bash
 kubectl apply -f manifests/00-namespace.yaml
 kubectl apply -f manifests/01-dash0-monitoring.yaml
 kubectl apply -f manifests/02-checkout-service.yaml
-kubectl apply -f manifests/03-load-profile.yaml
-kubectl apply -f manifests/04-load-generator.yaml
-kubectl apply -f manifests/05-metric-emitter.yaml
-kubectl apply -f manifests/06-control-panel.yaml
+kubectl apply -f manifests/03-inventory-service.yaml
+kubectl apply -f manifests/04-load-profile.yaml
+kubectl apply -f manifests/05-load-generator.yaml
+kubectl apply -f manifests/06-metric-emitter.yaml
+kubectl apply -f manifests/07-control-panel.yaml
 
-for d in checkout-service load-generator metric-emitter control-panel; do
+for d in checkout-service inventory-service load-generator metric-emitter control-panel; do
   kubectl -n sc-test rollout status deploy/$d
 done
 ```
@@ -408,6 +410,48 @@ healthcheck log is being stored, which is what the next step removes.
 > Write the numbers down. Every claim in steps 3 to 6 is a comparison against
 > this baseline, and it is far more convincing to show the delta than to assert
 > it.
+
+#### Making it look like one application
+
+Before applying any rules, it is worth opening **Services → Catalog** and
+**Services → Map**, because the test bed is deliberately set up to read as a
+single application rather than a bag of unrelated workloads. Two attributes do
+all of the work.
+
+`service.namespace=sc-gen` is set on every workload that emits telemetry, and
+it is what Dash0 groups the catalog and the map by:
+
+| Workload | `service.name` | `service.namespace` | In the map? |
+| --- | --- | --- | --- |
+| checkout-service | `checkout-service` | `sc-gen` | yes, with an outgoing edge |
+| inventory-service | `inventory-service` | `sc-gen` | yes, as its callee |
+| metric-emitter | `sc-gen-metric-emitter` | `sc-gen` | catalog only |
+
+The map edge comes from trace context, not from configuration. `/checkout`
+makes a real HTTP call to inventory-service, the injected agent propagates
+`traceparent` across it, and Dash0 infers the dependency from the resulting
+parent-child spans. Nothing declares the topology.
+
+Two things are worth knowing about the limits of this:
+
+- **The metric emitter can appear in the catalog but never in the map.** It
+  emits metrics only, and metrics carry no trace context, so there is no edge
+  to infer. The shared `service.namespace` is what ties it to the other two.
+- **The load generator is invisible on purpose.** It is labelled
+  `dash0.com/enable: "false"`, so it is uninstrumented and produces no spans of
+  its own. That keeps the span volume reaching Signal Control equal to what
+  checkout-service and inventory-service generate, which is what makes the
+  before-and-after numbers in the later steps clean. Remove the label and you
+  gain a third node with an inbound edge, at the cost of every rule in steps 3
+  to 5 also matching the generator's client spans.
+
+> [!NOTE]
+> Splitting `/inventory` out into its own service changed no telemetry volume.
+> It is still three spans per `/checkout` with the same operation names and the
+> same attributes; the `/inventory` SERVER span simply carries a different
+> `service.name` now. The rules in `10` through `12` match on
+> `dash0.operation.name` and HTTP attributes, never on `service.name`, so none
+> of them needed changing.
 
 ### Step 3: two spam filters — `10`
 
@@ -557,34 +601,53 @@ kubectl delete -f manifests/10-spam-filters.yaml \
   namespace is a no-op.
 - **[manifests/01-dash0-monitoring.yaml](manifests/01-dash0-monitoring.yaml).**
   A `Dash0Monitoring` resource with `instrumentWorkloads.mode: all`. This is
-  what auto-instruments checkout-service and collects its logs. Without it the
-  namespace produces no telemetry.
+  what auto-instruments checkout-service and inventory-service and collects
+  their logs. Without it the namespace produces no telemetry.
 - **[manifests/02-checkout-service.yaml](manifests/02-checkout-service.yaml).**
   A dependency-free Node.js HTTP server, source inlined in a ConfigMap and run
   on the stock `node:22-alpine` image. No build, no registry, no image pull
-  beyond a public base image. `/checkout` calls `/inventory` on itself, so it
-  produces a multi-span trace and you can see whether a sampling decision
-  applies to the whole trace or just one span.
+  beyond a public base image. `/checkout` calls inventory-service, so it
+  produces a three-span distributed trace and you can see whether a sampling
+  decision applies to the whole trace or just one span.
+- **[manifests/03-inventory-service.yaml](manifests/03-inventory-service.yaml).**
+  The downstream half of that trace, serving the single `/inventory` call. It
+  exists so the trace crosses a service boundary: the injected agent propagates
+  `traceparent` on the outbound call, which is what lets Dash0 draw a
+  **checkout-service → inventory-service edge** in the service map. `/inventory`
+  used to be a handler on checkout-service calling `127.0.0.1`, which produced
+  the same three spans but no edge, because both ends were the same service.
+
+  Numbered `03`, straight after checkout-service, since the two are one request
+  path. Neither has to be applied first: checkout-service retries per request,
+  so whichever starts second just ends the brief window where `/checkout`
+  returns 500.
 
   > [!NOTE]
-  > It sets `OTEL_SERVICE_NAME=checkout-service` explicitly. The operator
-  > injects the collector endpoint and protocol but **not** a service name, so
-  > without it the Node SDK falls back to its own default and every span, log
-  > and RED metric arrives as `service.name="unknown_service:node"` — even
-  > though `k8s.deployment.name` is set correctly. Copy the env var into any
-  > workload you add.
-- **[manifests/03-load-profile.yaml](manifests/03-load-profile.yaml).** A
+  > Both set `OTEL_SERVICE_NAME` explicitly. The operator injects the collector
+  > endpoint and protocol but **not** a service name, so without it the Node SDK
+  > falls back to its own default and every span, log and RED metric arrives as
+  > `service.name="unknown_service:node"` — even though `k8s.deployment.name` is
+  > set correctly. Copy the env var into any workload you add.
+
+  > [!NOTE]
+  > Both also set `OTEL_RESOURCE_ATTRIBUTES=service.namespace=sc-gen,...`, and
+  > the metric emitter sets the same `service.namespace` on its own resource.
+  > That attribute is what makes Dash0 present these as components of one
+  > application rather than unrelated services that happen to share a cluster —
+  > it groups them in the catalog and the map. See
+  > [Making it look like one application](#making-it-look-like-one-application).
+- **[manifests/04-load-profile.yaml](manifests/04-load-profile.yaml).** A
   ConfigMap defining the traffic: one entry per stream, with a path, a request
   interval, and the `dash0.operation.name` its spans will carry. **This is the
   file you edit to change what the test bed sends.** The generator re-reads it
   every 10 seconds, so an edit takes effect without a restart. Allow up to a
   minute for kubelet to propagate the change into the pod.
-- **[manifests/04-load-generator.yaml](manifests/04-load-generator.yaml).** A
+- **[manifests/05-load-generator.yaml](manifests/05-load-generator.yaml).** A
   dependency-free Node generator that drives one loop per stream and reports
   what it actually sent on `GET /stats`. Labelled `dash0.com/enable: "false"`
   so the operator leaves it uninstrumented: only checkout-service spans reach
   Signal Control, and the generator's own stats endpoint produces no telemetry.
-- **[manifests/05-metric-emitter.yaml](manifests/05-metric-emitter.yaml).**
+- **[manifests/06-metric-emitter.yaml](manifests/06-metric-emitter.yaml).**
   Emits synthetic OTLP metrics every 10 seconds, for experimenting with time
   series aggregation. Ships a gauge and a monotonic sum, each with 18 series:
   one per combination of `sc_gen.service` × `sc_gen.region` × `sc_gen.tier`.
@@ -616,13 +679,13 @@ rule:
 | Endpoint | Rate | What it is for |
 | --- | --- | --- |
 | `/health` | ~5/s | High-volume, zero-value telemetry. The spam-filter target. |
-| `/checkout` | ~1/s | Multi-span trace, 12% HTTP 500. Error and probabilistic sampling, plus signal-to-metrics. |
+| `/checkout` | ~1/s | Distributed three-span trace across two services, 12% HTTP 500. Error and probabilistic sampling, plus signal-to-metrics. |
 | `/search?q=<rand>` | ~0.5/s | The rate-limit target. |
 | `/orders/<rand>` | ~0.5/s | A high-cardinality path, and a workload with no rule of its own. |
 
 ### The control panel
 
-**[manifests/06-control-panel.yaml](manifests/06-control-panel.yaml)** is a web
+**[manifests/07-control-panel.yaml](manifests/07-control-panel.yaml)** is a web
 UI for the test bed. It is numbered `06` so that `kubectl apply -f manifests/`
 brings it up **before** the rules in `10` to `12`: the panel is how you watch
 each rule land, so it needs to be running and showing an unfiltered baseline

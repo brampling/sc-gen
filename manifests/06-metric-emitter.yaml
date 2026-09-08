@@ -22,6 +22,7 @@ data:
       "intervalSeconds": 10,
       "startupDelaySeconds": 20,
       "serviceName": "sc-gen-metric-emitter",
+      "serviceNamespace": "sc-gen",
       "constantAttributes": {
         "sc_gen.source": "sc-gen"
       },
@@ -145,6 +146,13 @@ data:
       const nowNanos = String(nowMs * 1e6);
       const resourceAttributes = {
         'service.name': profile.serviceName || 'sc-gen-metric-emitter',
+        // Groups this emitter with checkout-service and inventory-service as
+        // one application in the Dash0 catalog. Without it the emitter is just
+        // an unrelated service that happens to share a cluster. Metrics carry
+        // no trace context, so it can never gain a service-map edge -- the
+        // shared namespace is what ties it to the rest.
+        'service.namespace': profile.serviceNamespace || 'sc-gen',
+        'deployment.environment.name': 'lab',
         // Set these explicitly. Without them the collector attributes the
         // metrics to the node rather than to this pod, and they do not show up
         // under the namespace.
@@ -316,6 +324,7 @@ data:
         intervalSeconds: profile.intervalSeconds || 10,
         startupDelaySeconds: profile.startupDelaySeconds ?? 20,
         serviceName: profile.serviceName || 'sc-gen-metric-emitter',
+        serviceNamespace: profile.serviceNamespace || 'sc-gen',
         constantAttributes: profile.constantAttributes || {},
         dimensions: profile.dimensions || {},
         seriesPerMetric: series.length,

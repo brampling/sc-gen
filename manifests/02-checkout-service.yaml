@@ -22,13 +22,20 @@ data:
       return new Promise((resolve) => setTimeout(resolve, ms));
     }
 
-    // Downstream call to ourselves, so /checkout produces a multi-span trace
-    // (server span -> client span -> server span). Useful for verifying that a
-    // sampling decision applies to the whole trace, not a single span.
+    // Downstream call to inventory-service, so /checkout produces a
+    // distributed trace: our SERVER span -> our CLIENT span ->
+    // inventory-service's SERVER span. Useful for verifying that a sampling
+    // decision applies to the whole trace, not a single span, and it is what
+    // gives the service map a real edge to draw.
+    //
+    // The injected agent propagates traceparent on this request, which is the
+    // only reason the two services end up in one trace rather than two.
+    const INVENTORY_HOST = process.env.INVENTORY_HOST || 'inventory-service';
+
     function callInventory(sku) {
       return new Promise((resolve, reject) => {
         const req = http.request(
-          { host: '127.0.0.1', port: PORT, path: `/inventory?sku=${sku}`, method: 'GET' },
+          { host: INVENTORY_HOST, port: PORT, path: `/inventory?sku=${sku}`, method: 'GET' },
           (res) => {
             res.resume();
             res.on('end', () => resolve(res.statusCode));
@@ -52,13 +59,6 @@ data:
           log('debug', 'healthcheck probe served', { endpoint: '/health', noise: true });
           res.writeHead(200, { 'content-type': 'application/json' });
           res.end('{"status":"ok"}');
-          return;
-        }
-
-        if (path === '/inventory') {
-          await sleep(20 + Math.random() * 40);
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ sku: url.searchParams.get('sku'), inStock: true }));
           return;
         }
 
@@ -135,6 +135,11 @@ spec:
             # service.name="unknown_service:node". Set it explicitly.
             - name: OTEL_SERVICE_NAME
               value: checkout-service
+            # service.namespace is what groups the services into one
+            # application in the Dash0 catalog and map. Every workload here
+            # that emits telemetry sets the same value.
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: service.namespace=sc-gen,deployment.environment.name=lab
           ports:
             - containerPort: 8080
           volumeMounts:

@@ -80,7 +80,7 @@ data:
           "emits": [
             {
               "signalType": "traces",
-              "note": "Three spans per request: the /checkout SERVER span, a CLIENT span for the call to /inventory, and the /inventory SERVER span. CLIENT spans carry no dash0.operation.name.",
+              "note": "Three spans per request, spanning two services: the /checkout SERVER span, a CLIENT span for the call to inventory-service, and the /inventory SERVER span from inventory-service. CLIENT spans carry no dash0.operation.name. This is the trace the service map draws its checkout-service -> inventory-service edge from.",
               "attributes": [
                 { "key": "dash0.operation.name", "example": "GET /checkout" },
                 { "key": "dash0.operation.type", "example": "http" },

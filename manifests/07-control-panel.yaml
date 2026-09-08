@@ -6,7 +6,7 @@
 #   kubectl -n sc-test port-forward svc/control-panel 8000:80
 #   open http://localhost:8000
 #
-# Numbered 06 so it deploys ahead of the rules in 10-12. The panel is how you
+# Numbered 07 so it deploys ahead of the rules in 10-12. The panel is how you
 # watch each rule land, so it has to already be running and showing an
 # unfiltered baseline before the first rule is applied.
 #
