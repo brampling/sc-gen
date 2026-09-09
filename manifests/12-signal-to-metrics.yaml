@@ -25,6 +25,7 @@ spec:
       - operator: is_one_of
         values:
           - service.name
+          - service.namespace
           - k8s.namespace.name
           - k8s.pod.name
     keepSignalAttributes:
@@ -57,4 +58,5 @@ spec:
       - operator: is_one_of
         values:
           - service.name
+          - service.namespace
           - k8s.namespace.name
