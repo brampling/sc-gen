@@ -331,7 +331,7 @@ it starts with no rules so each one is visible as you add it.
    open http://localhost:8000
    ```
 
-4. Give the rules 2 to 3 minutes to sync to the backend and reach the edge
+4. Give the rules up to 5 minutes to sync to the backend and reach the edge
    collector, then check what actually landed in Dash0.
 
    ```bash
@@ -355,6 +355,19 @@ its own step so you can watch it take effect.
 The manifests are numbered for exactly this. `00` through `07` are the workload
 and the control panel; `10` through `12` are the rules. Nothing in `00-07`
 depends on a rule existing.
+
+> [!IMPORTANT]
+> **Allow up to 5 minutes after applying a rule before concluding anything.**
+> Every step below says this, and it is the single most common way to talk
+> yourself into a bug that is not there. A rule has to be accepted by the
+> backend, reach the edge collector, and then be picked up by the processor that
+> enforces it, and each of those hops has its own cache or poll interval. For
+> signal-to-metrics there is a further wait, because derived metrics are only
+> emitted on a flush interval — so the rule can be live and correct and still
+> have produced no data point yet.
+>
+> `.status.synchronizationStatus` going to `successful` only tells you the
+> *first* hop finished. It is not a signal that the rule is in force.
 
 ### Step 1: the operator and Signal Control — no manifests
 
@@ -468,7 +481,7 @@ kubectl apply -f manifests/10-spam-filters.yaml
 kubectl -n sc-test get dash0spamfilter
 ```
 
-Give it 2 to 3 minutes to reach the edge collector, then:
+Give it up to 5 minutes to reach the edge collector, then:
 
 ```bash
 ./verify.sh --only rules,traces,logs
@@ -504,7 +517,7 @@ kubectl apply -f manifests/11-sampling-rules.yaml
 kubectl -n sc-test get dash0samplingrule
 ```
 
-Wait 2 to 3 minutes, then:
+Wait up to 5 minutes, then:
 
 ```bash
 ./verify.sh --only rules,traces
@@ -533,7 +546,7 @@ kubectl apply -f manifests/12-signal-to-metrics.yaml
 kubectl -n sc-test get dash0signaltometrics
 ```
 
-Wait 2 to 3 minutes, then:
+Wait up to 5 minutes, then:
 
 ```bash
 ./verify.sh --only metrics
