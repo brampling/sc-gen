@@ -1020,6 +1020,8 @@ spec:
       labels:
         app: control-panel
         dash0.com/enable: "false"
+        app.kubernetes.io/name: control-panel
+        app.kubernetes.io/part-of: sc-gen
     spec:
       serviceAccountName: control-panel
       terminationGracePeriodSeconds: 10

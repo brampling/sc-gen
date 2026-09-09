@@ -227,6 +227,8 @@ spec:
       labels:
         app: load-generator
         dash0.com/enable: "false"
+        app.kubernetes.io/name: load-generator
+        app.kubernetes.io/part-of: sc-gen
     spec:
       # The generator stops on SIGTERM, so it does not need the default 30s.
       # Keeps the control panel's off switch feeling immediate.

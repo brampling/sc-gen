@@ -77,6 +77,11 @@ spec:
     metadata:
       labels:
         app: inventory-service
+        # Service identity for collected container logs. See the longer note in
+        # 02-checkout-service.yaml for why these labels are the only thing that
+        # provides it.
+        app.kubernetes.io/name: inventory-service
+        app.kubernetes.io/part-of: sc-gen
     spec:
       containers:
         - name: inventory-service

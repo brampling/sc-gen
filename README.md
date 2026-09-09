@@ -445,6 +445,31 @@ makes a real HTTP call to inventory-service, the injected agent propagates
 `traceparent` across it, and Dash0 infers the dependency from the resulting
 parent-child spans. Nothing declares the topology.
 
+> [!IMPORTANT]
+> **Set service identity twice: once for the SDK, once for collected logs.**
+> `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` only reach telemetry the
+> SDK emits. The injected agent sets `OTEL_LOGS_EXPORTER=none`, so container
+> logs are scraped from stdout by the node agent instead, and that path derives
+> service identity from **pod labels alone**:
+>
+> | Pod label | Becomes |
+> | --- | --- |
+> | `app.kubernetes.io/name` | `service.name` |
+> | `app.kubernetes.io/part-of` | `service.namespace` |
+> | `app.kubernetes.io/version` | `service.version` |
+>
+> and only when `service.name` is not already set. A plain `app:` label — the
+> obvious thing to write, and what this repo used at first — is not read by
+> anything, so the logs arrive with no service identity at all.
+>
+> You may not notice, because the backend correlates stored logs back to their
+> pod and the UI then *shows* the right service. But that happens downstream of
+> Signal Control, so a rule sees the unidentified resource. The visible symptom
+> is a signal-to-metrics rule over logs: it has no `service.name` to keep, so
+> its output metric is attributed to `service.name="signal-to-metrics"` while
+> the equivalent rule over spans is attributed to the workload. Every workload
+> here now carries both labels for exactly this reason.
+
 Two things are worth knowing about the limits of this:
 
 - **The metric emitter can appear in the catalog but never in the map.** It

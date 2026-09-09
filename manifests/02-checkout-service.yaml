@@ -123,6 +123,16 @@ spec:
     metadata:
       labels:
         app: checkout-service
+        # Container logs are collected by the node agent, not the SDK, so their
+        # service identity comes from these labels and nowhere else: the agent
+        # derives service.name from app.kubernetes.io/name and
+        # service.namespace from app.kubernetes.io/part-of, and only when
+        # service.name is not already set. Without them the log resource
+        # reaches Signal Control unidentified, and a signal-to-metrics rule
+        # over logs has no service.name to keep -- so its output metric falls
+        # back to service.name="signal-to-metrics" instead of this workload.
+        app.kubernetes.io/name: checkout-service
+        app.kubernetes.io/part-of: sc-gen
     spec:
       containers:
         - name: checkout-service

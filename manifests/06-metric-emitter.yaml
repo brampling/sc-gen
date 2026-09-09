@@ -386,6 +386,8 @@ spec:
       labels:
         app: metric-emitter
         dash0.com/enable: "false"
+        app.kubernetes.io/name: sc-gen-metric-emitter
+        app.kubernetes.io/part-of: sc-gen
     spec:
       terminationGracePeriodSeconds: 10
       containers:
