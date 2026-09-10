@@ -1,25 +1,38 @@
 # Signal-to-metrics derives metrics at the edge from 100% of signals, before
 # sampling -- so these stay accurate no matter how few traces are retained.
 ---
-# Spans -> exponential histogram of checkout latency.
+# Spans -> exponential histogram of outbound dependency latency.
+#
+# Deliberately chosen to be something RED metrics cannot give you. The RED
+# connector skips CLIENT spans outright, so how long checkout-service waits on
+# inventory-service does not exist as a RED series -- only the inbound
+# /checkout and /inventory SERVER spans do. This rule measures the call itself,
+# broken out by the peer being called and the status it returned.
 apiVersion: operator.dash0.com/v1alpha1
 kind: Dash0SignalToMetrics
 metadata:
-  name: checkout-duration
+  name: dependency-duration
   namespace: sc-test
 spec:
   enabled: true
   display:
-    name: Checkout duration
+    name: Dependency call duration
   match:
     signal: spans
     filters:
-      - key: dash0.operation.name
+      # otel.span.kind is a synthetic field: it is not a span attribute, it is
+      # the span's kind enum surfaced to the filter engine as a string.
+      - key: otel.span.kind
         operator: is
-        value: GET /checkout
+        value: CLIENT
+      # Scope it to this application. Without this the collectors' own gRPC
+      # client spans in dash0-system would match too.
+      - key: service.namespace
+        operator: is
+        value: sc-gen
   output:
-    name: sc_test.checkout.duration
-    description: Latency of /checkout requests, derived at the edge from all spans
+    name: sc_test.dependency.duration
+    description: Latency of outbound calls, which RED metrics do not cover
     interval: 30s
     keepResourceAttributes:
       - operator: is_one_of
@@ -29,10 +42,27 @@ spec:
           - k8s.namespace.name
           - k8s.pod.name
     keepSignalAttributes:
+      # net.peer.name is the callee. This is the label that makes the metric
+      # worth having: it turns one histogram into per-dependency latency.
+      # http.target is deliberately absent -- it carries the sku query
+      # parameter, so keeping it would multiply the series count by the
+      # catalogue size.
+      #
+      # Both semconv spellings of method and status are listed on purpose. The
+      # connector copies from the raw span as it arrives at the edge, and the
+      # Node agent here still emits the pre-1.0 names (http.method,
+      # http.status_code) -- Dash0 normalises them to http.request.method and
+      # http.response.status_code further downstream, so a rule naming only the
+      # modern spelling silently keeps nothing. See the note in the README.
       - operator: is_one_of
         values:
-          - http.response.status_code
+          - net.peer.name
+          - http.method
+          - http.status_code
           - http.request.method
+          - http.response.status_code
+    # otel.span.status.code is NOT listed: the connector adds it to every
+    # span-derived metric unconditionally, before keepSignalAttributes runs.
 ---
 # Logs -> count of failed checkouts.
 apiVersion: operator.dash0.com/v1alpha1

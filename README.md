@@ -594,14 +594,42 @@ dimension on a high-cardinality metric. `k8s.pod.label.pod-template-hash` is in
 there too, so RED series turn over on every rollout.
 
 > [!IMPORTANT]
-> Because `dash0.operation.name` is required, **CLIENT spans are excluded**. The
-> `/checkout` → inventory-service call carries no operation name, so it generates
-> no RED metric. That is why `verify.sh` compares RED against stored spans *per
-> operation* and buckets client spans separately: comparing the two totals would
-> look like sampling had dropped something it did not.
+> The required operation name is what silently excludes whole classes of span.
+> Operation enrichment happens in the collector, one processor *before* the RED
+> connector, and it only covers **SERVER, CONSUMER and root** spans. So the
+> `/checkout` → inventory-service call — a CLIENT span with a parent — is never
+> given an operation name and produces **no RED metric at all**. That is why
+> `verify.sh` compares RED against stored spans *per operation* and buckets
+> client spans separately: comparing the two totals would look like sampling had
+> dropped something it did not.
+>
+> Do not read this off the stored span. Dash0 assigns operation names again on
+> ingest, so a client span in the UI often *does* show a
+> `dash0.operation.name` — long after the RED connector declined to count it.
 
 So step 5 is not "how do I get metrics from spans" — you have those. It is how to
 get a metric you *chose*, over the signals and dimensions you picked.
+
+#### So when is a rule worth writing?
+
+RED already answers "how is this operation doing", completely and for free. A
+signal-to-metrics rule earns its place when it measures something RED
+structurally cannot, and there are three of those:
+
+- **A signal RED does not read.** RED is spans only. Counting log records — the
+  second rule below — has no other route.
+- **A span RED skips.** A CLIENT span with a parent gets no operation name and
+  so no RED metric, which means how long *your* service waits on a dependency is
+  unavailable from RED at all. That is the gap the first rule fills.
+- **A dimension RED does not keep.** RED's datapoint attributes are fixed at the
+  four above. Anything else on the span — `net.peer.name`,
+  `http.request.method`, a queue name, a tenant id — cannot become a label on
+  `dash0.spans.red` at any cardinality. A rule picks its own.
+
+The mental model to leave people with: RED is one fixed-shape metric per
+operation, produced for everything, whether or not anyone asked. A
+signal-to-metrics rule is a narrow, named metric over a slice you chose, with
+the dimensions you chose, at the interval you chose.
 
 #### Now the rules
 
@@ -616,10 +644,36 @@ Wait up to 5 minutes, then:
 ./verify.sh --only metrics
 ```
 
-**What to point out.** `sc_test.checkout.duration` is derived from spans and
-`sc_test.checkout.failures` from log records, and both count 100% of the signals
-regardless of how little the sampler kept. That is the argument for
-signal-to-metrics: aggressive sampling without losing the numbers.
+**What to point out.** Two things, in this order.
+
+First, the rules pick up where RED stops. `sc_test.dependency.duration` matches
+`otel.span.kind = CLIENT`, so it measures the checkout-service →
+inventory-service call broken out by `net.peer.name` — a span RED refuses and a
+label RED cannot carry. There is deliberately no RED series to compare it to;
+that is the point. `sc_test.checkout.failures` counts log records, which RED
+never looks at.
+
+Second, both count **100% of the signals** regardless of how little the sampler
+kept a step ago. That is the argument for signal-to-metrics: sample as hard as
+the budget demands, without losing the numbers that matter.
+
+> [!WARNING]
+> **`keepSignalAttributes` names must match the raw span, not the span you see
+> in Dash0.** The connector copies attributes off the span as it arrives at the
+> collector. Dash0 normalises old semantic conventions to current ones on
+> ingest — deliberately, so that conventions are consistent across the platform
+> regardless of SDK age — but that happens *after* the edge. The Node agent
+> here still emits `http.method` and
+> `http.status_code`; the UI shows them as `http.request.method` and
+> `http.response.status_code`. A rule that names what the UI shows matches the
+> spans fine and then keeps **nothing** — you get a valid metric that is just
+> missing the labels you asked for, with no error anywhere. `12` lists both
+> spellings for exactly this reason. If a label you expected is absent, suspect
+> this before anything else.
+>
+> The reverse also holds: `otel.span.status.code` appears on the metric even
+> though the rule never asks for it. Span rules always get it, so there is no
+> need to list it.
 
 ### Step 6: time series aggregation — Dash0 UI only
 
@@ -842,10 +896,11 @@ edit, not a recommended production config. Delete the ones you do not want.
   one operation to 10/min, and a 1% baseline under everything else. Rules are
   OR'd, so the baseline adds to what the others keep rather than diluting it.
 - **[manifests/12-signal-to-metrics.yaml](manifests/12-signal-to-metrics.yaml).**
-  Two `Dash0SignalToMetrics` resources: a latency histogram derived from spans,
-  and a failure counter derived from log records. Both are computed from 100% of
-  signals before sampling, so they stay accurate no matter how little the
-  sampler retains.
+  Two `Dash0SignalToMetrics` resources: a dependency-latency histogram derived
+  from CLIENT spans, and a failure counter derived from log records. Both are
+  chosen to be things RED metrics cannot produce, and both are computed from
+  100% of signals before sampling, so they stay accurate no matter how little
+  the sampler retains.
 
 To add them one step at a time and see each one take effect, follow
 [Guided rollout](#guided-rollout-adding-the-rules-one-step-at-a-time) rather

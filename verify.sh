@@ -359,8 +359,11 @@ if want('metrics'):
     print('=== metrics ===')
 
     # -- signal-to-metrics output
-    for suffix, source in (('duration', 'spans'), ('failures', 'logs')):
-        name = f'{METRIC_PREFIX}.checkout.{suffix}'
+    # Names come from manifests/12-signal-to-metrics.yaml. Rename a rule's
+    # output there and this list has to follow.
+    for suffix, source in (('dependency.duration', 'spans'),
+                           ('checkout.failures', 'logs')):
+        name = f'{METRIC_PREFIX}.{suffix}'
         v = scalar(f'sum({{otel_metric_name="{name}"}})')
         print(f'  signal-to-metrics  {name:34} {fmt(v, ".1f")}  (from {source})')
 
