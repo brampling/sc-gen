@@ -24,7 +24,7 @@
 #   SECRET_NAMESPACE default dash0-system
 #   SECRET_NAME      default dash0-authorization-secret
 #   NAMESPACE        default sc-test
-#   METRIC_PREFIX    default sc_test   (matches 12-signal-to-metrics.yaml)
+#   METRIC_PREFIX    default sc_test   (matches 11-signal-to-metrics.yaml)
 #   EMITTER_METRICS  default the two sc_gen.synthetic.* metrics
 #   RATIO_WINDOW     default 30m       (rate() window for the in/out ratio)
 set -euo pipefail
@@ -359,7 +359,7 @@ if want('metrics'):
     print('=== metrics ===')
 
     # -- signal-to-metrics output
-    # Names come from manifests/12-signal-to-metrics.yaml. Rename a rule's
+    # Names come from manifests/11-signal-to-metrics.yaml. Rename a rule's
     # output there and this list has to follow.
     for suffix, source in (('dependency.duration', 'spans'),
                            ('checkout.failures', 'logs')):

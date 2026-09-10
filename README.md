@@ -356,6 +356,13 @@ The manifests are numbered for exactly this. `00` through `07` are the workload
 and the control panel; `10` through `12` are the rules. Nothing in `00-07`
 depends on a rule existing.
 
+The rules are numbered in the order the **collector** applies them, not in the
+order the Dash0 UI lists them: the spam filter (`10`) drops signals outright, so
+everything after it only ever sees what survived; metric derivation (`11`) then
+happens on a branch that parallels the sampling pipeline, so sampling (`12`)
+cannot affect it. Following that order means each step's effect is visible in the
+steps after it, and the demo builds instead of doubling back.
+
 > [!IMPORTANT]
 > **Allow up to 5 minutes after applying a rule before concluding anything.**
 > Every step below says this, and it is the single most common way to talk
@@ -535,36 +542,39 @@ The control panel tags both rules `drop` on the `/health` row.
 > the filters were still passing traffic at 3m21s and were enforced by 6m36s.
 > Re-run `verify.sh` until the effect appears rather than waiting a fixed time.
 
-### Step 4: sampling rules — `11`
+### Step 4: signal-to-metrics — `11`
 
-```bash
-kubectl apply -f manifests/11-sampling-rules.yaml
-kubectl -n sc-test get dash0samplingrule
+Metrics come before sampling here because that is the order the collector works
+in. The `traces/sc/default` pipeline runs the spam filter from step 3, then
+**fans the surviving spans out to three independent consumers**:
+
+```
+pipeline traces/sc/default
+  otlp -> … -> dash0operation -> dash0filter
+                                      |
+     +--------------------------------+--------------------------+
+     v                                v                          v
+forward/traces-to-sampling     dash0redmetrics        dash0signaltometrics
+     |                                |                          |
+     v                                +------------+-------------+
+traces/sampled  (step 5)                           v
+                                        pipeline metrics/derived -> exporter
 ```
 
-Wait up to 5 minutes, then:
+The two metric connectors are **siblings** of the sampling branch, not
+downstream of it, and their output leaves through a separate `metrics/derived`
+pipeline that the trace data never re-enters. Nothing the sampler decides can
+reach them.
+
+Doing this step first turns the sampling step that follows into a measurement
+rather than a promise: derive the metrics, note the numbers, then throw almost
+all the traces away and watch the numbers not move. You can read the pipeline
+off your own cluster with:
 
 ```bash
-./verify.sh --only rules,traces
+kubectl -n dash0-system get cm dash0-operator-signal-control-collector-cm \
+  -o jsonpath='{.data.config\.yaml}' | grep -A 12 'traces/sc/default:'
 ```
-
-**What to point out.** Traces come back, but selectively. Every `GET /checkout
-[500]` is retained by `keep-all-errors`; roughly a quarter of the `[200]`s by
-`sample-checkout-25pct`; `GET /orders/:id` appears only at the 1% baseline. Each
-rule shows on its signal row in the panel, tagged `keep`.
-
-To show one rule's contribution in isolation, delete the others and put them
-back. Rules are OR'd, so removing one only ever retains less:
-
-```bash
-kubectl -n sc-test delete dash0samplingrule baseline-sample-1pct \
-  sample-checkout-25pct rate-limit-search
-./verify.sh --only traces --window 10m      # errors only
-
-kubectl apply -f manifests/11-sampling-rules.yaml
-```
-
-### Step 5: signal-to-metrics — `12`
 
 #### First: RED metrics you get for free
 
@@ -574,8 +584,8 @@ turns every span into a duration histogram called `dash0.spans.red`, and that
 synthetic metric is what **every RED number in the Dash0 app** is read from — the
 request rates, error percentages and latency percentiles in the service catalog,
 and the per-operation breakdown when you open a service. None of it is computed
-from stored spans, which is why those numbers stay correct after sampling throws
-most of the spans away.
+from stored spans, which is why those numbers will still be correct in step 5,
+once sampling has thrown most of the spans away.
 
 It keeps **four span-derived attributes**, and only four:
 
@@ -600,15 +610,15 @@ there too, so RED series turn over on every rollout.
 > `/checkout` → inventory-service call — a CLIENT span with a parent — is never
 > given an operation name and produces **no RED metric at all**. That is why
 > `verify.sh` compares RED against stored spans *per operation* and buckets
-> client spans separately: comparing the two totals would look like sampling had
-> dropped something it did not.
+> client spans separately: once the sampling step is in place, comparing the
+> two totals would look like sampling had dropped something it did not.
 >
 > Do not read this off the stored span. Dash0 assigns operation names again on
 > ingest, so a client span in the UI often *does* show a
 > `dash0.operation.name` — long after the RED connector declined to count it.
 
-So step 5 is not "how do I get metrics from spans" — you have those. It is how to
-get a metric you *chose*, over the signals and dimensions you picked.
+So this step is not "how do I get metrics from spans" — you have those. It is how
+to get a metric you *chose*, over the signals and dimensions you picked.
 
 #### So when is a rule worth writing?
 
@@ -634,7 +644,7 @@ the dimensions you chose, at the interval you chose.
 #### Now the rules
 
 ```bash
-kubectl apply -f manifests/12-signal-to-metrics.yaml
+kubectl apply -f manifests/11-signal-to-metrics.yaml
 kubectl -n sc-test get dash0signaltometrics
 ```
 
@@ -644,18 +654,16 @@ Wait up to 5 minutes, then:
 ./verify.sh --only metrics
 ```
 
-**What to point out.** Two things, in this order.
+**What to point out.** The rules pick up where RED stops.
+`sc_test.dependency.duration` matches `otel.span.kind = CLIENT`, so it measures
+the checkout-service → inventory-service call broken out by `net.peer.name` — a
+span RED refuses and a label RED cannot carry. There is deliberately no RED
+series to compare it to; that is the point. `sc_test.checkout.failures` counts
+log records, which RED never looks at.
 
-First, the rules pick up where RED stops. `sc_test.dependency.duration` matches
-`otel.span.kind = CLIENT`, so it measures the checkout-service →
-inventory-service call broken out by `net.peer.name` — a span RED refuses and a
-label RED cannot carry. There is deliberately no RED series to compare it to;
-that is the point. `sc_test.checkout.failures` counts log records, which RED
-never looks at.
-
-Second, both count **100% of the signals** regardless of how little the sampler
-kept a step ago. That is the argument for signal-to-metrics: sample as hard as
-the budget demands, without losing the numbers that matter.
+**Write the numbers down before moving on.** Both metrics, and the RED series,
+are about to be put through a sampler that discards almost everything. Step 5
+is where they either hold or they don't.
 
 > [!WARNING]
 > **`keepSignalAttributes` names must match the raw span, not the span you see
@@ -667,13 +675,58 @@ the budget demands, without losing the numbers that matter.
 > `http.status_code`; the UI shows them as `http.request.method` and
 > `http.response.status_code`. A rule that names what the UI shows matches the
 > spans fine and then keeps **nothing** — you get a valid metric that is just
-> missing the labels you asked for, with no error anywhere. `12` lists both
+> missing the labels you asked for, with no error anywhere. `11` lists both
 > spellings for exactly this reason. If a label you expected is absent, suspect
 > this before anything else.
 >
 > The reverse also holds: `otel.span.status.code` appears on the metric even
 > though the rule never asks for it. Span rules always get it, so there is no
 > need to list it.
+
+### Step 5: sampling rules — `12`
+
+```bash
+kubectl apply -f manifests/12-sampling-rules.yaml
+kubectl -n sc-test get dash0samplingrule
+```
+
+Wait up to 5 minutes, then:
+
+```bash
+./verify.sh --only rules,traces,metrics
+```
+
+**What to point out.** Two things now, and the second is the one that lands.
+
+First, traces come back selectively. Every `GET /checkout [500]` is retained by
+`keep-all-errors`; roughly a quarter of the `[200]`s by `sample-checkout-25pct`;
+`GET /orders/:id` appears only at the 1% baseline. Each rule shows on its signal
+row in the panel, tagged `keep`.
+
+Second, compare the metrics section against the numbers you noted in step 4.
+Stored traces have collapsed, while `sc_test.dependency.duration`,
+`sc_test.checkout.failures` and the RED series **keep climbing at the same
+rate** — they are counting every signal the spam filter passed, whatever the
+sampler then decided, because they were derived on a branch the sampler never
+touches. Run it twice a minute apart if you want the rate rather than the
+totals. That is the whole argument for Signal Control: sample as hard as the
+budget demands and keep the numbers anyway.
+
+Note the qualifier. These metrics see 100% of what reaches the connectors, which
+is 100% of what **step 3 let through** — a spam-filtered operation has no RED
+series and cannot be counted by a rule either. Sampling is free of that
+tradeoff; spam filtering is not.
+
+To show one rule's contribution in isolation, delete the others and put them
+back. Rules are OR'd, so removing one only ever retains less:
+
+```bash
+kubectl -n sc-test delete dash0samplingrule baseline-sample-1pct \
+  sample-checkout-25pct rate-limit-search
+./verify.sh --only traces --window 10m      # errors only
+
+kubectl apply -f manifests/12-sampling-rules.yaml
+```
 
 ### Step 6: time series aggregation — Dash0 UI only
 
@@ -719,8 +772,8 @@ without waiting for pods:
 
 ```bash
 kubectl delete -f manifests/10-spam-filters.yaml \
-               -f manifests/11-sampling-rules.yaml \
-               -f manifests/12-signal-to-metrics.yaml
+               -f manifests/11-signal-to-metrics.yaml \
+               -f manifests/12-sampling-rules.yaml
 ```
 
 ## What each file does
@@ -890,17 +943,18 @@ edit, not a recommended production config. Delete the ones you do not want.
 - **[manifests/10-spam-filters.yaml](manifests/10-spam-filters.yaml).** Two
   `Dash0SpamFilter` resources that drop `/health` spans and their debug log
   lines at the edge, before they leave the cluster.
-- **[manifests/11-sampling-rules.yaml](manifests/11-sampling-rules.yaml).** Four
+- **[manifests/11-signal-to-metrics.yaml](manifests/11-signal-to-metrics.yaml).**
+  Two `Dash0SignalToMetrics` resources: a dependency-latency histogram derived
+  from CLIENT spans, and a failure counter derived from log records. Both are
+  chosen to be things RED metrics cannot produce. They are numbered ahead of the
+  sampling rules because the collector derives metrics on a branch that parallels
+  the sampling pipeline rather than following it, so they stay accurate no matter
+  how little the sampler retains.
+- **[manifests/12-sampling-rules.yaml](manifests/12-sampling-rules.yaml).** Four
   `Dash0SamplingRule` resources covering the distinct condition kinds: keep all
   errors, keep 25% of one operation via `and(ottl, probabilistic)`, rate-limit
   one operation to 10/min, and a 1% baseline under everything else. Rules are
   OR'd, so the baseline adds to what the others keep rather than diluting it.
-- **[manifests/12-signal-to-metrics.yaml](manifests/12-signal-to-metrics.yaml).**
-  Two `Dash0SignalToMetrics` resources: a dependency-latency histogram derived
-  from CLIENT spans, and a failure counter derived from log records. Both are
-  chosen to be things RED metrics cannot produce, and both are computed from
-  100% of signals before sampling, so they stay accurate no matter how little
-  the sampler retains.
 
 To add them one step at a time and see each one take effect, follow
 [Guided rollout](#guided-rollout-adding-the-rules-one-step-at-a-time) rather
@@ -946,7 +1000,7 @@ Configure it with environment variables:
 | `SECRET_NAMESPACE` | `dash0-system` | Where the operator's auth secret lives. |
 | `SECRET_NAME` | `dash0-authorization-secret` | |
 | `NAMESPACE` | `sc-test` | Must match the namespace in the manifests. |
-| `METRIC_PREFIX` | `sc_test` | Must match the output names in `12-signal-to-metrics.yaml`. |
+| `METRIC_PREFIX` | `sc_test` | Must match the output names in `11-signal-to-metrics.yaml`. |
 | `EMITTER_METRICS` | the two `sc_gen.synthetic.*` metrics | Space-separated. Volume is decomposed for each. |
 | `RATIO_WINDOW` | `30m` | `rate()` window for the aggregation in/out ratio. |
 
@@ -1045,7 +1099,7 @@ for the same two rules.
 ## Running in a different namespace
 
 Change the name in `00-namespace.yaml`, in the `metadata.namespace` of every
-other manifest, and in the metric output names in `12-signal-to-metrics.yaml`.
+other manifest, and in the metric output names in `11-signal-to-metrics.yaml`.
 Then pass `NAMESPACE` and `METRIC_PREFIX` to `verify.sh`.
 
 There is no templating here on purpose. The manifests are meant to be read and
