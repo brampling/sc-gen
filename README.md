@@ -636,8 +636,6 @@ RED already answers "how is this operation doing", completely and for free. A
 signal-to-metrics rule earns its place when it measures something RED
 structurally cannot, and there are three of those:
 
-- **A signal RED does not read.** RED is spans only. Counting log records — the
-  second rule below — has no other route.
 - **A span RED skips.** A CLIENT span with a parent gets no operation name and
   so no RED metric, which means how long *your* service waits on a dependency is
   unavailable from RED at all. That is the gap the first rule fills.
@@ -645,6 +643,8 @@ structurally cannot, and there are three of those:
   four above. Anything else on the span — `net.peer.name`,
   `http.request.method`, a queue name, a tenant id — cannot become a label on
   `dash0.spans.red` at any cardinality. A rule picks its own.
+- **A signal RED does not read.** RED is spans only. Counting log records — the
+  second rule below — has no other route.
 
 The mental model to leave people with: RED is one fixed-shape metric per
 operation, produced for everything, whether or not anyone asked. A
