@@ -76,14 +76,18 @@ want() {
 
 if want rules; then
   echo "=== rules synced to the backend ==="
-  # dash0timeseriesaggregations needs operator 0.155.0 or later; on older
-  # operators the CRD is absent and kubectl errors on the whole request, so it
-  # is queried separately and its failure ignored.
-  kubectl get dash0samplingrules,dash0spamfilters,dash0signaltometrics -n "$NAMESPACE" \
+  # dash0timeseriesaggregations needs operator 0.155.0 or later. Asking for a
+  # kind whose CRD is absent fails the whole request, so it is added to the
+  # list only once the CRD is confirmed -- which keeps every kind in a single
+  # aligned table instead of appending a second one with its own column widths.
+  RULE_KINDS=dash0samplingrules,dash0spamfilters,dash0signaltometrics
+  if kubectl get crd dash0timeseriesaggregations.operator.dash0.com >/dev/null 2>&1; then
+    RULE_KINDS="$RULE_KINDS,dash0timeseriesaggregations"
+  else
+    echo "  (no dash0timeseriesaggregations CRD -- operator predates 0.155.0)"
+  fi
+  kubectl get "$RULE_KINDS" -n "$NAMESPACE" \
     -o custom-columns='KIND:.kind,NAME:.metadata.name,SYNC:.status.synchronizationStatus'
-  kubectl get dash0timeseriesaggregations -n "$NAMESPACE" \
-    -o custom-columns='KIND:.kind,NAME:.metadata.name,SYNC:.status.synchronizationStatus' \
-    2>/dev/null | tail -n +2 || true
   echo "  (on a failure, the reason is in .status.synchronizationResults[].synchronizationError)"
   echo
 fi
