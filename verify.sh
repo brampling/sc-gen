@@ -76,8 +76,14 @@ want() {
 
 if want rules; then
   echo "=== rules synced to the backend ==="
+  # dash0timeseriesaggregations needs operator 0.155.0 or later; on older
+  # operators the CRD is absent and kubectl errors on the whole request, so it
+  # is queried separately and its failure ignored.
   kubectl get dash0samplingrules,dash0spamfilters,dash0signaltometrics -n "$NAMESPACE" \
     -o custom-columns='KIND:.kind,NAME:.metadata.name,SYNC:.status.synchronizationStatus'
+  kubectl get dash0timeseriesaggregations -n "$NAMESPACE" \
+    -o custom-columns='KIND:.kind,NAME:.metadata.name,SYNC:.status.synchronizationStatus' \
+    2>/dev/null | tail -n +2 || true
   echo "  (on a failure, the reason is in .status.synchronizationResults[].synchronizationError)"
   echo
 fi

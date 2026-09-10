@@ -1,8 +1,8 @@
 # sc-gen — a Dash0 Signal Control test bed
 
 A small, self-contained Kubernetes workload that generates telemetry shaped to
-exercise Dash0 Signal Control: spam filters, tail-sampling rules, and
-signal-to-metrics.
+exercise Dash0 Signal Control: spam filters, tail-sampling rules,
+signal-to-metrics and time series aggregation.
 
 Apply it, open the control panel to switch traffic on and see what is being
 sent, then run `./verify.sh` to see what the rules actually did to it.
@@ -15,9 +15,14 @@ Control change before you point it at real traffic.
 > [!IMPORTANT]
 > Nothing in this repo works without the Dash0 operator installed in your
 > cluster **and** the SignalControl Edge collector setting enabled. The
-> `Dash0SpamFilter`, `Dash0SamplingRule` and `Dash0SignalToMetrics` custom
-> resources do not exist until the operator installs their CRDs, and the rules
-> have nothing to run on until the edge collector is on.
+> `Dash0SpamFilter`, `Dash0SamplingRule`, `Dash0SignalToMetrics` and
+> `Dash0TimeSeriesAggregation` custom resources do not exist until the operator
+> installs their CRDs, and the rules have nothing to run on until the edge
+> collector is on.
+>
+> This repo targets operator **`0.155.0`** or later. `Dash0TimeSeriesAggregation`
+> arrived in `0.155.0`; on `0.154.0` and earlier, step 6 has to be done in the
+> Dash0 UI instead.
 
 Enabling Signal Control takes **two** steps, and it is easy to do only the first
 and wonder why no rule ever fires:
@@ -117,7 +122,7 @@ dash0-operator-opentelemetry-collector-agent-daemonset-... 3/3  Running
 > `operator.signalControlCollectorImage.*` and `operator.edgeProxyImage.*` if
 > you need a specific build, and move both together — they speak a rules
 > broadcast protocol to each other. To do that, see
-> [Pinning the Signal Control images](#pinning-the-signal-control-images-to-110)
+> [Running a specific Signal Control build](#running-a-specific-signal-control-build)
 > *after* step 4, not here: the deployments those overrides target do not exist
 > until step 4 creates them.
 
@@ -191,44 +196,58 @@ is what actually built the pipeline.
 
 Nothing downstream works until both Deployments are running.
 
-#### Pinning the Signal Control images to 1.1.0
+> [!WARNING]
+> Rolling these two pods clears the tail-sampling reservoir, the trace decision
+> cache, and every in-memory Signal Control counter. Do it before you start a
+> measurement, never in the middle of one. That applies to any Helm upgrade
+> that retargets their images, including the one below.
 
-> [!CAUTION]
-> **Local lab workaround, not a recommendation.** This pins image versions the
-> chart does not select by default, purely so this lab runs a known pair. Do
-> not copy it into anything shared, and delete this section once the chart's
-> defaults make it unnecessary. If you are not the author of this repo, skip it
-> — the chart default is the supported path.
+#### Running a specific Signal Control build
 
-> [!IMPORTANT]
-> This has to come **after step 4**. The override retargets the two Deployments
-> the operator manages, and those do not exist until the `Dash0SignalControl`
-> resource is applied. Run it before step 4 and the `rollout status` commands
-> below fail with `NotFound`. So the components come up on the chart's pinned
-> version first and this rolls them to `1.1.0` — two rollouts, which is fine.
+You do not need this for a normal install. Chart `0.155.0` defaults to
+`signal-control-collector:1.2.0` and `edge-proxy:1.2.0` — a matched pair, and
+the supported path. Take the default unless you are deliberately testing
+another build.
 
-Chart `0.153.0` and `0.154.0` both pin `v2.0.3005` for the two Signal Control
-components, so a fresh install of the current chart does not pick up the newer
-`1.1.0` build. The collector has also **moved repository**, which means a
-tag-only override is not enough:
+Earlier charts did need an override. `0.153.0` and `0.154.0` both defaulted to
+`v2.0.3005`, a build tag rather than a release, so a fresh install did not pick
+up the `1.1.0` components; `0.155.0` replaced that with a real version. If you
+are on an older chart, upgrade rather than pin.
 
-| | Chart default | Current |
-| --- | --- | --- |
-| Collector | `ghcr.io/dash0hq/signal-control-collector` | `ghcr.io/dash0hq/signal-control-edge-collector` |
-| Edge Proxy | `ghcr.io/dash0hq/edge-proxy` | unchanged |
+To point the two components at a particular build:
 
 ```bash
 helm upgrade dash0-operator dash0-operator/dash0-operator \
   --namespace dash0-system --reuse-values \
-  --set operator.signalControlCollectorImage.repository=ghcr.io/dash0hq/signal-control-edge-collector \
-  --set operator.signalControlCollectorImage.tag=1.1.0 \
-  --set operator.edgeProxyImage.tag=1.1.0
+  --set operator.signalControlCollectorImage.tag=1.2.0 \
+  --set operator.edgeProxyImage.tag=1.2.0
 ```
 
-`--reuse-values` matters: without it you lose `operator.signalControl.enabled`
-and `operator.dash0Export.*`, and Signal Control switches itself off.
+Three things to know before you do:
 
-Verify both landed, then wait for the rollout:
+- **`--reuse-values` is not optional.** Without it you lose
+  `operator.signalControl.enabled` and `operator.dash0Export.*`, and Signal
+  Control switches itself off.
+- **Run it after step 4.** The override retargets the two Deployments the
+  operator manages, and they do not exist until the `Dash0SignalControl`
+  resource is applied.
+- **Move both together.** They speak a rules broadcast protocol to each other,
+  so a mismatched pair is not a supported configuration.
+
+The collector is also published under a second repository,
+`ghcr.io/dash0hq/signal-control-edge-collector`, with the same tags but
+different digests. The chart points at `signal-control-collector`; add
+`--set operator.signalControlCollectorImage.repository=...` if you specifically
+need the other one. Tags and build dates are not reliable discriminators
+between them — match by the git revision label instead:
+
+```bash
+docker buildx imagetools inspect \
+  --format '{{range $p,$i := .Image}}{{index $i.Config.Labels "org.opencontainers.image.revision"}}{{"\n"}}{{break}}{{end}}' \
+  ghcr.io/dash0hq/edge-proxy:1.2.0
+```
+
+Then confirm what landed and wait for the rollout:
 
 ```bash
 kubectl -n dash0-system get pods \
@@ -239,35 +258,6 @@ kubectl -n dash0-system rollout status deploy/dash0-operator-edge-proxy
 kubectl -n dash0-system rollout status \
   deploy/dash0-operator-signal-control-collector-deployment
 ```
-
-> [!IMPORTANT]
-> Match the two by the **git revision label**, not by tag name or build date.
-> Both of these are unreliable here: the collector publishes `1.1.0` in *both*
-> repositories with different digests, its `1.0.0` and `1.1.0` carry an
-> identical `created` timestamp, and `1.1.0` sorts below `v2.0.3005` under
-> semver while actually superseding it.
->
-> ```
-> image:tag                              revision       source repo
-> signal-control-edge-collector:1.1.0    f1170f7362f3   signal-control-edge
-> edge-proxy:1.1.0                       f1170f7362f3   signal-control-edge   <- matched pair
-> signal-control-collector:v2.0.3005     422aa1d3a2be   dash0-operator
-> edge-proxy:v2.0.3005                   422aa1d3a2be   dash0-operator        <- matched pair
-> ```
->
-> Read it off an image with (these are multi-arch, so `.Image` is a map keyed
-> by platform and has to be ranged over):
-> ```bash
-> docker buildx imagetools inspect \
->   --format '{{range $p,$i := .Image}}{{index $i.Config.Labels "org.opencontainers.image.revision"}}{{"\n"}}{{break}}{{end}}' \
->   ghcr.io/dash0hq/edge-proxy:1.1.0
-> ```
-
-> [!WARNING]
-> Rolling these two pods clears the tail-sampling reservoir, the trace decision
-> cache, and every in-memory Signal Control counter. Do it before you start a
-> measurement, never in the middle of one.
-
 
 ### 5. Verify the install
 
@@ -316,7 +306,7 @@ it starts with no rules so each one is visible as you add it.
 
 1. Apply everything. The filename prefixes give the right order, and
    `kubectl apply` walks the directory alphabetically: the workload and control
-   panel in `00` to `07`, then the rules in `10` to `12`.
+   panel in `00` to `07`, then the rules in `10` to `13`.
 
    ```bash
    kubectl apply -f manifests/
@@ -362,15 +352,17 @@ org, gets traffic flowing with **no rules at all**, then adds each rule kind as
 its own step so you can watch it take effect.
 
 The manifests are numbered for exactly this. `00` through `07` are the workload
-and the control panel; `10` through `12` are the rules. Nothing in `00-07`
+and the control panel; `10` through `13` are the rules. Nothing in `00-07`
 depends on a rule existing.
 
 The rules are numbered in the order the **collector** applies them, not in the
 order the Dash0 UI lists them: the spam filter (`10`) drops signals outright, so
 everything after it only ever sees what survived; metric derivation (`11`) then
 happens on a branch that parallels the sampling pipeline, so sampling (`12`)
-cannot affect it. Following that order means each step's effect is visible in the
-steps after it, and the demo builds instead of doubling back.
+cannot affect it. Aggregation (`13`) comes last because it is the only one that
+runs in the Dash0 backend rather than in your cluster, downstream of everything
+the edge collector did. Following that order means each step's effect is visible
+in the steps after it, and the demo builds instead of doubling back.
 
 > [!IMPORTANT]
 > **Allow up to 5 minutes after applying a rule before concluding anything.**
@@ -524,7 +516,7 @@ Two things are worth knowing about the limits of this:
 > Splitting `/inventory` out into its own service changed no telemetry volume.
 > It is still three spans per `/checkout` with the same operation names and the
 > same attributes; the `/inventory` SERVER span simply carries a different
-> `service.name` now. The rules in `10` through `12` match on
+> `service.name` now. The rules in `10` through `13` match on
 > `dash0.operation.name` and HTTP attributes, never on `service.name`, so none
 > of them needed changing.
 
@@ -758,38 +750,54 @@ kubectl -n sc-test delete dash0samplingrule baseline-sample-1pct \
 kubectl apply -f manifests/12-sampling-rules.yaml
 ```
 
-### Step 6: time series aggregation — Dash0 UI only
+### Step 6: time series aggregation — `13`
 
-There is no operator CRD for this, so it is the one step done in the Dash0 UI
-rather than with `kubectl`. Create two rules against the emitter's metrics:
+```bash
+kubectl apply -f manifests/13-time-series-aggregation.yaml
+kubectl -n sc-test get dash0timeseriesaggregation
+```
 
-| Rule | Match | Setting | Shows |
-| --- | --- | --- | --- |
-| spatial | `sc_gen.synthetic.gauge` | `drop_attributes` on `sc_gen.tier`, context **datapoint**, interval **10s** | 18 series → 9 |
-| temporal | `sc_gen.synthetic.counter` | interval **1m** | 10s → 60s sampling |
+Wait up to 5 minutes, then:
 
 ```bash
 ./verify.sh --only metrics
 ```
 
-**What to point out.** Volume is `series × samples per series`, and the two
-rules move different factors. See
+Three rules against the emitter's metrics:
+
+| Rule | Priority | Match | Setting | Shows |
+| --- | --- | --- | --- | --- |
+| spatial | 2 | `sc_gen.synthetic.gauge` | `drop_attributes` on `sc_gen.tier`, context **datapoint**, interval **10s** | 18 series → 9 |
+| temporal | 2 | `sc_gen.synthetic.counter` | interval **1m** | 10s → 60s sampling |
+| catchall | 3 | `starts_with sc_gen` | interval **5m** | nothing — see below |
+
+**What to point out.** Two things.
+
+First, volume is `series × samples per series`, and the first two rules move
+different factors. See
 [Measuring a time series aggregation rule](#measuring-a-time-series-aggregation-rule)
 for the arithmetic and the traps, especially the `context` one — a rule with the
 wrong context syncs cleanly, drops nothing, and *increases* volume.
+
+Second, `catchall` is the precedence lesson, and it is worth the two minutes.
+It matches **both** metrics the other rules match, and at a far more aggressive
+5m interval — yet it changes nothing. Only one rule is ever applied to a
+datapoint, and the **lower `priority` wins**, so `spatial` and `temporal` at 2
+keep their metrics. Raise `catchall` to `1`, wait, and re-run: it takes both
+over and the other two go quiet. That is the whole model — matching is not
+winning.
+
+> [!IMPORTANT]
+> Operator `0.155.0` added `Dash0TimeSeriesAggregation`. Before it, aggregation
+> was the one rule type with no CRD, so this step had to be recreated by hand
+> in the Dash0 UI for every new org. If you are on `0.154.0` or earlier the CRD
+> does not exist and `kubectl apply` fails — use the UI, or upgrade.
 
 > [!NOTE]
 > **Every** Signal Control rule lives in the org, this one included. The
 > operator does not evaluate the CRs in your cluster: it syncs each one to the
 > Dash0 API and the rule then applies org-wide within its dataset. The
 > `.status.synchronizationStatus` field on a CR is reporting exactly that push.
->
-> So the difference here is only the **management interface**. Spam filters,
-> sampling rules and signal-to-metrics have CRDs, so they can be declared in Git
-> and re-applied with `kubectl`. Aggregation has no CRD, so it can only be
-> created through the UI or `/api/time-series-aggregations` — which means it is
-> the one step this repo cannot capture, and it has to be recreated by hand in
-> each new org.
 >
 > A corollary worth stating: a rule is **not** scoped to the namespace its CR
 > sits in. The namespace only decides which dataset it is pushed to. A
@@ -803,7 +811,8 @@ without waiting for pods:
 ```bash
 kubectl delete -f manifests/10-spam-filters.yaml \
                -f manifests/11-signal-to-metrics.yaml \
-               -f manifests/12-sampling-rules.yaml
+               -f manifests/12-sampling-rules.yaml \
+               -f manifests/13-time-series-aggregation.yaml
 ```
 
 ## What each file does
@@ -907,7 +916,7 @@ rule:
 
 **[manifests/07-control-panel.yaml](manifests/07-control-panel.yaml)** is a web
 UI for the test bed. It is numbered `06` so that `kubectl apply -f manifests/`
-brings it up **before** the rules in `10` to `12`: the panel is how you watch
+brings it up **before** the rules in `10` to `13`: the panel is how you watch
 each rule land, so it needs to be running and showing an unfiltered baseline
 before the first rule exists. Reach it with a port-forward:
 
@@ -991,6 +1000,13 @@ edit, not a recommended production config. Delete the ones you do not want.
   errors, keep 25% of one operation via `and(ottl, probabilistic)`, rate-limit
   one operation to 10/min, and a 1% baseline under everything else. Rules are
   OR'd, so the baseline adds to what the others keep rather than diluting it.
+- **[manifests/13-time-series-aggregation.yaml](manifests/13-time-series-aggregation.yaml).**
+  Three `Dash0TimeSeriesAggregation` resources against the emitter's metrics:
+  one spatial (drops an attribute, collapsing series), one temporal (resamples
+  slower, cutting samples per series), and a deliberately inert catchall that
+  matches both of the others' metrics at a more aggressive interval and still
+  changes nothing — because only one rule applies per datapoint and the lower
+  `priority` wins. Requires operator `0.155.0`, which introduced the CRD.
 
 To add them one step at a time and see each one take effect, follow
 [Guided rollout](#guided-rollout-adding-the-rules-one-step-at-a-time) rather
@@ -1127,10 +1143,14 @@ for the same two rules.
 
 > [!WARNING]
 > Aggregation rules execute in the Dash0 backend, not at the edge collector, so
-> `timeSeriesAggregationSettings` in `/api/edge/settings` stays empty even with a
-> working rule. Check `/api/time-series-aggregations`. There is no operator CRD
-> for these, so create them in the Dash0 UI or API rather than with
-> `kubectl apply`.
+> `timeSeriesAggregationSettings` in `/api/edge/settings` stays empty even with
+> a working rule. That empty list is not the bug you are looking for — check
+> `/api/time-series-aggregations` instead, which is where they show up.
+>
+> This is the one rule type whose CR is declared in the cluster but never
+> evaluated there at all: `Dash0TimeSeriesAggregation` (operator `0.155.0`+) is
+> a management interface onto a backend rule. Its metering therefore arrives
+> tagged `dash0.signal_control.environment="saas"`, never `edge`.
 
 ## Running in a different namespace
 

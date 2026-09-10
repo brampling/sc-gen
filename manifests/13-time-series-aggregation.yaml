@@ -1,0 +1,93 @@
+# Time series aggregation cuts metric volume. Volume is
+# `series x samples per series`, and these two rules move different factors:
+# spatial aggregation drops an attribute, collapsing series; temporal
+# aggregation resamples slower, cutting samples per series.
+#
+# New in operator 0.155.0. Before that there was no CRD for aggregation and
+# this step had to be done by hand in the Dash0 UI, which is why it is the
+# last manifest rather than sharing 12's numbering.
+---
+# Spatial: drop an attribute, so the series that differed only by that
+# attribute collapse into one. 18 series -> 9.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0TimeSeriesAggregation
+metadata:
+  name: spatial
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Spatial - drop sc_gen.tier
+  # Lower priority wins, and only one rule is ever applied to a datapoint.
+  # spatial and temporal sit at 2 so the catchall at 3 cannot take their
+  # metrics away from them.
+  priority: 2
+  match:
+    metricNameMatcher:
+      operator: is
+      value: sc_gen.synthetic.gauge
+  attributeModifications:
+    - kind: drop_attributes
+      spec:
+        # context matters more than anything else here. sc_gen.tier is a
+        # datapoint attribute, so dropping it in the resource or scope context
+        # matches nothing, syncs cleanly, and collapses no series at all --
+        # while still resampling the metric at the interval below, which can
+        # *increase* volume. If a rule reports no reduction, check this first.
+        context: datapoint
+        keyMatcher:
+          operator: is
+          value: sc_gen.tier
+  sample:
+    interval: 10s
+    delay: 15s
+    staleAfter: 100s
+---
+# Temporal: keep every series, emit them less often. The emitter produces at
+# 10s, so a 1m interval keeps one datapoint in six.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0TimeSeriesAggregation
+metadata:
+  name: temporal
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Temporal - resample to 1m
+  priority: 2
+  match:
+    metricNameMatcher:
+      operator: is
+      value: sc_gen.synthetic.counter
+  # No attributeModifications: every attribute is kept, so the series count is
+  # unchanged and only the sampling rate moves.
+  sample:
+    interval: 1m
+    delay: 15s
+    staleAfter: 100s
+---
+# Catchall: deliberately inert, and kept because proving that is the lesson.
+#
+# It matches every sc_gen metric, which includes both metrics above, and it
+# resamples at 5m -- far more aggressive than either. It still does nothing to
+# them, because matching is not the same as winning: Dash0 picks exactly one
+# rule per datapoint and the lower priority takes it. Raise this to 1, or drop
+# the other two, and it takes over immediately.
+apiVersion: operator.dash0.com/v1alpha1
+kind: Dash0TimeSeriesAggregation
+metadata:
+  name: catchall
+  namespace: sc-test
+spec:
+  enabled: true
+  display:
+    name: Catchall - everything else at 5m
+  priority: 3
+  match:
+    metricNameMatcher:
+      operator: starts_with
+      value: sc_gen
+  sample:
+    interval: 5m
+    delay: 15s
+    staleAfter: 50m
