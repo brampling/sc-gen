@@ -117,14 +117,10 @@ dash0-operator-opentelemetry-collector-agent-daemonset-... 3/3  Running
 
 > [!NOTE]
 > The Signal Control collector and Edge Proxy are versioned **independently** of
-> the operator and pinned by the chart, so their image tags do not track the
-> chart's `appVersion`. Override with
-> `operator.signalControlCollectorImage.*` and `operator.edgeProxyImage.*` if
-> you need a specific build, and move both together — they speak a rules
-> broadcast protocol to each other. To do that, see
-> [Running a specific Signal Control build](#running-a-specific-signal-control-build)
-> *after* step 4, not here: the deployments those overrides target do not exist
-> until step 4 creates them.
+> the operator, so their image tags do not track the chart's `appVersion` — on
+> chart `0.155.0` they are `1.2.0`, not `0.155.0`. The chart pins a matched
+> pair, and the two speak a rules broadcast protocol to each other, so take the
+> chart's versions. If you need a newer Signal Control, upgrade the chart.
 
 ### 4. Enable the Signal Control pipeline
 
@@ -199,65 +195,8 @@ Nothing downstream works until both Deployments are running.
 > [!WARNING]
 > Rolling these two pods clears the tail-sampling reservoir, the trace decision
 > cache, and every in-memory Signal Control counter. Do it before you start a
-> measurement, never in the middle of one. That applies to any Helm upgrade
-> that retargets their images, including the one below.
-
-#### Running a specific Signal Control build
-
-You do not need this for a normal install. Chart `0.155.0` defaults to
-`signal-control-collector:1.2.0` and `edge-proxy:1.2.0` — a matched pair, and
-the supported path. Take the default unless you are deliberately testing
-another build.
-
-Earlier charts did need an override. `0.153.0` and `0.154.0` both defaulted to
-`v2.0.3005`, a build tag rather than a release, so a fresh install did not pick
-up the `1.1.0` components; `0.155.0` replaced that with a real version. If you
-are on an older chart, upgrade rather than pin.
-
-To point the two components at a particular build:
-
-```bash
-helm upgrade dash0-operator dash0-operator/dash0-operator \
-  --namespace dash0-system --reuse-values \
-  --set operator.signalControlCollectorImage.tag=1.2.0 \
-  --set operator.edgeProxyImage.tag=1.2.0
-```
-
-Three things to know before you do:
-
-- **`--reuse-values` is not optional.** Without it you lose
-  `operator.signalControl.enabled` and `operator.dash0Export.*`, and Signal
-  Control switches itself off.
-- **Run it after step 4.** The override retargets the two Deployments the
-  operator manages, and they do not exist until the `Dash0SignalControl`
-  resource is applied.
-- **Move both together.** They speak a rules broadcast protocol to each other,
-  so a mismatched pair is not a supported configuration.
-
-The collector is also published under a second repository,
-`ghcr.io/dash0hq/signal-control-edge-collector`, with the same tags but
-different digests. The chart points at `signal-control-collector`; add
-`--set operator.signalControlCollectorImage.repository=...` if you specifically
-need the other one. Tags and build dates are not reliable discriminators
-between them — match by the git revision label instead:
-
-```bash
-docker buildx imagetools inspect \
-  --format '{{range $p,$i := .Image}}{{index $i.Config.Labels "org.opencontainers.image.revision"}}{{"\n"}}{{break}}{{end}}' \
-  ghcr.io/dash0hq/edge-proxy:1.2.0
-```
-
-Then confirm what landed and wait for the rollout:
-
-```bash
-kubectl -n dash0-system get pods \
-  -o custom-columns='POD:.metadata.name,IMAGE:.spec.containers[*].image' \
-  | grep -E 'signal-control|edge-proxy'
-
-kubectl -n dash0-system rollout status deploy/dash0-operator-edge-proxy
-kubectl -n dash0-system rollout status \
-  deploy/dash0-operator-signal-control-collector-deployment
-```
+> measurement, never in the middle of one — a Helm upgrade that touches them
+> counts.
 
 ### 5. Verify the install
 
