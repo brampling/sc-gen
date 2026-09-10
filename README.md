@@ -299,21 +299,6 @@ is the actual answer to "is this cluster on the edge path". Measured on a
 freshly installed cluster with nothing but `dash0-system` and `kube-system`
 running, this reported `0.41` spans/s through `component="filter"`.
 
-> [!CAUTION]
-> **Do not use `signalControlEdge` from `/api/edge/settings` as an install
-> check.** It is tempting — it is a boolean called "signal control edge" — but
-> it is a per-*organization* entitlement flag meaning "this org is allowed to
-> use Signal Control features". The request carries only your org token and no
-> cluster identity, so it cannot report anything about a cluster: it reads
-> `{"enabled":true}` before you install the operator, and keeps reading that
-> after you uninstall it. It is also a pre-release gate that is expected to
-> disappear at GA, at which point grepping for it starts looking like a broken
-> install.
->
-> `/api/edge/settings` is still worth knowing — it returns the rules the org has
-> compiled for the edge, which is what `verify.sh --only rules` reports. Just
-> not this field, and not as a health check.
-
 > [!NOTE]
 > With Signal Control on and no sampling rules, traces keep flowing. Measured
 > at 95% retention on a fresh cluster, the shortfall being spans still in
