@@ -281,7 +281,14 @@ if want('rules'):
     if d.get('status') == 'error':
         print(f'  ERR {d["error"]}')
     else:
-        print(f'  org: {d.get("technicalID")} | signalControlEdge: {d.get("signalControlEdge")}')
+        # signalControlEdge is an ORG entitlement flag ("this org may use
+        # Signal Control"), not a statement about this cluster -- the request
+        # carries no cluster identity. It reads enabled:true before the
+        # operator is installed and after it is removed, so never treat it as
+        # an install check. Labelled 'org entitled' here for that reason.
+        # It is also a pre-release gate expected to vanish at GA.
+        ent = (d.get('signalControlEdge') or {}).get('enabled')
+        print(f'  org: {d.get("technicalID")} | org entitled to signal control: {ent}')
         filters = [f for s in d.get('datasetSettings', []) for f in s.get('telemetryFilters', [])]
         # timeSeriesAggregationSettings is the EDGE-side list and stays empty
         # for a normal aggregation rule: those execute in the SaaS backend

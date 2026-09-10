@@ -278,19 +278,41 @@ kubectl get dash0signalcontrol dash0-signal-control \
   -o jsonpath='{.status.conditions[?(@.type=="Available")]}{"\n"}'
 ```
 
-A healthy install reports `"status":"True","reason":"ReconcileFinished"`. Then
-confirm the backend agrees that this cluster is on the edge path:
+A healthy install reports `"status":"True","reason":"ReconcileFinished"`.
+
+That is the operator's own view, though. To confirm that telemetry from this
+cluster is genuinely going through the **edge** collector rather than being
+processed SaaS-side, ask for the edge collector's own throughput. This works
+straight after install, with no workload deployed — the operator's own
+self-telemetry is enough to register:
 
 ```bash
-curl -sH "Authorization: Bearer $DASH0_AUTH_TOKEN" \
-  "$DASH0_API_URL/api/edge/settings" | grep -o '"signalControlEdge":[^,]*'
+curl -sG -H "Authorization: Bearer $DASH0_AUTH_TOKEN" \
+  --data-urlencode 'query=sum by (dash0_signal_control_component) (rate({otel_metric_name="dash0.signal_control.spans_in", dash0_signal_control_environment="edge"}[5m]))' \
+  "$DASH0_API_URL/api/prometheus/api/v1/query"
 ```
 
-which should print:
+A non-zero rate against `dash0_signal_control_environment="edge"` means your
+cluster's own collector is doing the work. The same metric reports
+`environment="saas"` for signals processed in the backend instead, so the label
+is the actual answer to "is this cluster on the edge path". Measured on a
+freshly installed cluster with nothing but `dash0-system` and `kube-system`
+running, this reported `0.41` spans/s through `component="filter"`.
 
-```
-"signalControlEdge":{"enabled":true}
-```
+> [!CAUTION]
+> **Do not use `signalControlEdge` from `/api/edge/settings` as an install
+> check.** It is tempting — it is a boolean called "signal control edge" — but
+> it is a per-*organization* entitlement flag meaning "this org is allowed to
+> use Signal Control features". The request carries only your org token and no
+> cluster identity, so it cannot report anything about a cluster: it reads
+> `{"enabled":true}` before you install the operator, and keeps reading that
+> after you uninstall it. It is also a pre-release gate that is expected to
+> disappear at GA, at which point grepping for it starts looking like a broken
+> install.
+>
+> `/api/edge/settings` is still worth knowing — it returns the rules the org has
+> compiled for the edge, which is what `verify.sh --only rules` reports. Just
+> not this field, and not as a health check.
 
 > [!NOTE]
 > With Signal Control on and no sampling rules, traces keep flowing. Measured
@@ -383,9 +405,10 @@ Work through
 above, all five steps, using the new org's endpoints and token. A brand-new
 cluster needs every one of them.
 
-When install step 5 reports `"status":"True","reason":"ReconcileFinished"` and
-`"signalControlEdge":{"enabled":true}`, you have a cluster producing no telemetry yet, with
-Signal Control armed and no rules. That is the starting line.
+When install step 5 reports `"status":"True","reason":"ReconcileFinished"`, the
+Signal Control pods are up, and its edge-throughput check returns a non-zero
+rate, you have a cluster producing no *application* telemetry yet, with Signal
+Control armed and no rules. That is the starting line.
 
 ### Step 2: traffic, with no rules — `00` to `07`
 
