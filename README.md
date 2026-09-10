@@ -566,6 +566,45 @@ kubectl apply -f manifests/11-sampling-rules.yaml
 
 ### Step 5: signal-to-metrics — `12`
 
+#### First: RED metrics you get for free
+
+Before applying a rule, it is worth being clear that Signal Control is *already*
+deriving metrics from spans, with no rule at all. The `dash0redmetrics` connector
+turns every span into a duration histogram called `dash0.spans.red`, and that
+synthetic metric is what **every RED number in the Dash0 app** is read from — the
+request rates, error percentages and latency percentiles in the service catalog,
+and the per-operation breakdown when you open a service. None of it is computed
+from stored spans, which is why those numbers stay correct after sampling throws
+most of the spans away.
+
+It keeps **four span-derived attributes**, and only four:
+
+| Attribute | Notes |
+| --- | --- |
+| `dash0.operation.name` | **Required.** A span without it produces no RED metric. |
+| `dash0.operation.type` | **Required**, same. |
+| `otel.span.kind` | `SERVER`, `CLIENT`, … |
+| `otel.span.status.code` | This is the E in RED. |
+
+On the resource side it keeps **everything** — the incoming resource map is
+emitted verbatim, so all ~50 attributes ride along: every `k8s.*`, `process.*`,
+`host.*`, `container.*` and `service.*` key, and every pod label and annotation.
+Worth knowing before adding labels to a busy workload, since each one becomes a
+dimension on a high-cardinality metric. `k8s.pod.label.pod-template-hash` is in
+there too, so RED series turn over on every rollout.
+
+> [!IMPORTANT]
+> Because `dash0.operation.name` is required, **CLIENT spans are excluded**. The
+> `/checkout` → inventory-service call carries no operation name, so it generates
+> no RED metric. That is why `verify.sh` compares RED against stored spans *per
+> operation* and buckets client spans separately: comparing the two totals would
+> look like sampling had dropped something it did not.
+
+So step 5 is not "how do I get metrics from spans" — you have those. It is how to
+get a metric you *chose*, over the signals and dimensions you picked.
+
+#### Now the rules
+
 ```bash
 kubectl apply -f manifests/12-signal-to-metrics.yaml
 kubectl -n sc-test get dash0signaltometrics
