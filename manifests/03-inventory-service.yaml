@@ -88,6 +88,8 @@ spec:
           image: node:22-alpine
           command: ["node", "/app/server.js"]
           env:
+            # Redundant with the app.kubernetes.io/name label above, and kept
+            # for readability. See the longer note in 02-checkout-service.yaml.
             - name: OTEL_SERVICE_NAME
               value: inventory-service
             # service.namespace is what groups the services into one

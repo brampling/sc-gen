@@ -463,11 +463,8 @@ makes a real HTTP call to inventory-service, the injected agent propagates
 parent-child spans. Nothing declares the topology.
 
 > [!IMPORTANT]
-> **Set service identity twice: once for the SDK, once for collected logs.**
-> `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES` only reach telemetry the
-> SDK emits. The injected agent sets `OTEL_LOGS_EXPORTER=none`, so container
-> logs are scraped from stdout by the node agent instead, and that path derives
-> service identity from **pod labels alone**:
+> **The pod labels, not the environment variables, are the identity that covers
+> everything.** These three:
 >
 > | Pod label | Becomes |
 > | --- | --- |
@@ -475,9 +472,26 @@ parent-child spans. Nothing declares the topology.
 > | `app.kubernetes.io/part-of` | `service.namespace` |
 > | `app.kubernetes.io/version` | `service.version` |
 >
-> and only when `service.name` is not already set. A plain `app:` label — the
-> obvious thing to write, and what this repo used at first — is not read by
-> anything, so the logs arrive with no service identity at all.
+> are read by **two independent mechanisms**, covering both telemetry paths:
+>
+> 1. **SDK telemetry.** At admission the operator injects
+>    `OTEL_INJECTOR_SERVICE_NAME` into each instrumented container as a *field
+>    reference* to the pod label, and the injector turns it into `service.name`
+>    on spans and metrics.
+> 2. **Container logs.** The injected agent sets `OTEL_LOGS_EXPORTER=none`, so
+>    logs are scraped from stdout by the node agent, which derives identity from
+>    the same labels in a collector transform.
+>
+> Both defer to an explicit value: the operator skips injection for any
+> container that sets `OTEL_SERVICE_NAME`, or `service.name=` inside
+> `OTEL_RESOURCE_ATTRIBUTES`, and the log transform only fires when
+> `service.name` is unset.
+>
+> The asymmetry is what bites. `OTEL_SERVICE_NAME` reaches **only** the SDK
+> path, so a workload with the variable and no labels gets identified spans and
+> *unidentified logs*. The labels reach both. And a plain `app:` label — the
+> obvious thing to write, and what this repo used at first — is read by neither,
+> so nothing is identified at all.
 >
 > You may not notice, because the backend correlates stored logs back to their
 > pod and the UI then *shows* the right service. But that happens downstream of
@@ -486,6 +500,12 @@ parent-child spans. Nothing declares the topology.
 > its output metric is attributed to `service.name="signal-to-metrics"` while
 > the equivalent rule over spans is attributed to the workload. Every workload
 > here now carries both labels for exactly this reason.
+>
+> The workloads still set `OTEL_SERVICE_NAME` as well, which is now redundant
+> for `service.name` — the labels would supply it. It is kept because it states
+> each service's identity where a reader of the manifest looks for it, and
+> because `OTEL_RESOURCE_ATTRIBUTES` is still doing real work:
+> `deployment.environment.name` has no label equivalent.
 
 Two things are worth knowing about the limits of this:
 
@@ -817,11 +837,17 @@ kubectl delete -f manifests/10-spam-filters.yaml \
   returns 500.
 
   > [!NOTE]
-  > Both set `OTEL_SERVICE_NAME` explicitly. The operator injects the collector
-  > endpoint and protocol but **not** a service name, so without it the Node SDK
-  > falls back to its own default and every span, log and RED metric arrives as
+  > Both set `OTEL_SERVICE_NAME` explicitly, which is belt-and-braces rather
+  > than required: their `app.kubernetes.io/name` pod label already gives the
+  > operator what it needs to inject a service name. Setting the variable makes
+  > the operator skip that derivation, and the value is identical either way.
+  >
+  > What a new workload actually cannot do without is **one of the two**. With
+  > neither the label nor the variable, the Node SDK falls back to its own
+  > default and every span, log and RED metric arrives as
   > `service.name="unknown_service:node"` — even though `k8s.deployment.name` is
-  > set correctly. Copy the env var into any workload you add.
+  > set correctly. The label is the better choice of the two, because it also
+  > covers container logs, which the variable does not.
 
   > [!NOTE]
   > Both also set `OTEL_RESOURCE_ATTRIBUTES=service.namespace=sc-gen,...`, and

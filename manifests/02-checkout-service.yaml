@@ -139,15 +139,25 @@ spec:
           image: node:22-alpine
           command: ["node", "/app/server.js"]
           env:
-            # The operator injects the collector endpoint and protocol but not a
-            # service name, so the Node SDK falls back to its own default and
-            # every span, log and RED metric arrives as
-            # service.name="unknown_service:node". Set it explicitly.
+            # Redundant, and kept deliberately. The app.kubernetes.io/name
+            # label above already gives the operator what it needs: it injects
+            # OTEL_INJECTOR_SERVICE_NAME into this container as a field
+            # reference to that label, and the injector turns it into
+            # service.name. Setting OTEL_SERVICE_NAME here makes the operator
+            # skip that derivation entirely -- a container's own service
+            # attributes always win -- and the value is the same either way.
+            # Kept because it states this service's identity where someone
+            # reading the manifest will look for it, rather than leaving it
+            # implied by a label.
             - name: OTEL_SERVICE_NAME
               value: checkout-service
             # service.namespace is what groups the services into one
             # application in the Dash0 catalog and map. Every workload here
             # that emits telemetry sets the same value.
+            #
+            # app.kubernetes.io/part-of would supply service.namespace too, and
+            # again the explicit value wins. deployment.environment.name has no
+            # label equivalent, so this variable is doing real work regardless.
             - name: OTEL_RESOURCE_ATTRIBUTES
               value: service.namespace=sc-gen,deployment.environment.name=lab
           ports:
