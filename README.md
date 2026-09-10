@@ -282,9 +282,11 @@ A healthy install reports `"status":"True","reason":"ReconcileFinished"`.
 
 That is the operator's own view, though. To confirm that telemetry from this
 cluster is genuinely going through the **edge** collector rather than being
-processed SaaS-side, ask for the edge collector's own throughput. This works
-straight after install, with no workload deployed — the operator's own
-self-telemetry is enough to register:
+processed SaaS-side, ask for the edge collector's own throughput.
+
+This needs **step 4 applied and the collector running**, but it does not need a
+workload: the operator's own self-telemetry is enough to register. Run it a few
+minutes after step 4, not before.
 
 ```bash
 curl -sG -H "Authorization: Bearer $DASH0_AUTH_TOKEN" \
@@ -296,8 +298,8 @@ A non-zero rate against `dash0_signal_control_environment="edge"` means your
 cluster's own collector is doing the work. The same metric reports
 `environment="saas"` for signals processed in the backend instead, so the label
 is the actual answer to "is this cluster on the edge path". Measured on a
-freshly installed cluster with nothing but `dash0-system` and `kube-system`
-running, this reported `0.41` spans/s through `component="filter"`.
+cluster with step 4 applied but no application workload at all, this reported
+`0.41` spans/s through `component="filter"`.
 
 > [!NOTE]
 > With Signal Control on and no sampling rules, traces keep flowing. Measured
